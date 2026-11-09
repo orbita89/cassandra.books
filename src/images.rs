@@ -1730,7 +1730,12 @@ fn encode_pool() -> &'static crossbeam_channel::Sender<EncodeJob> {
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|n| *n > 0)
             .unwrap_or_else(|| {
-                std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+                // 1.5x ядер: decode / resize / encode дают короткие CPU-bound
+                // отрезки, и на переходах между ними честные N потоков
+                // недогружают ядра.
+                std::thread::available_parallelism()
+                    .map(|n| (n.get() * 3 / 2).max(2))
+                    .unwrap_or(6)
             });
         let (tx, rx) = crossbeam_channel::unbounded::<EncodeJob>();
         for i in 0..threads {
