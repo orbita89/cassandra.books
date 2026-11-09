@@ -197,6 +197,7 @@ fn write_import_log(
     books: usize,
     failed: usize,
     skipped: usize,
+    foreign: &[ForeignBook],
 ) {
     let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
     let mut s = String::new();
@@ -234,6 +235,32 @@ fn write_import_log(
 
     s.push('\n');
     s.push_str(&profile_text(cores, cfg));
+
+    // Кого не взяли в архив из-за языка. Список уже уходит в отдельный
+    // `skipped_foreign.txt`, но решение видно только в одном месте — в
+    // отчёте об импорте, поэтому дублируем его здесь.
+    if !foreign.is_empty() {
+        s.push('\n');
+        s.push_str("Не попали в архив: отброшены фильтром «только русские»\n");
+        s.push_str("=============================================================\n");
+        s.push_str(
+            "Решение принято по буквам текста, а не по названию: русская книга\n\
+             с английским заголовком остаётся, а книга ниже — нет. Чтобы\n\
+             оставить всё, импортируйте с LIBRARY_LANG_FILTER=0.\n\n",
+        );
+        for f in foreign {
+            s.push_str(&format!(
+                "{} | {} | {} | {} | букв {}, кириллицы {:.1} %, нерусских кириллических {:.2} %\n",
+                f.id,
+                f.title,
+                f.author,
+                f.reason,
+                f.stats.letters(),
+                f.stats.cyrillic_share() * 100.0,
+                f.stats.foreign_share() * 100.0,
+            ));
+        }
+    }
 
     let path = data_dir.join("import.log");
     match fs::write(&path, s) {
@@ -717,6 +744,7 @@ fn run_import(
         all_books.len(),
         failed.load(Ordering::Relaxed),
         skipped.load(Ordering::Relaxed),
+        &foreign,
     );
     let _ = tx.send(WorkerMsg::Finished {
         books: all_books.len(),
