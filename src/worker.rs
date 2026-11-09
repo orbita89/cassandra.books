@@ -589,31 +589,47 @@ fn process_one(
     // Язык определяется по буквам самого текста, а не по названию. Название и
     // аннотация на английском у русской книги — обычное дело, поэтому
     // метаданным здесь верить нельзя.
-    if lang.enabled {
+    // Проверке языка и конвертеру нужны одни и те же байты, а конвертер
+    // читает файл сам: FB2 на 20 МБ читался дважды. Читаем один раз и отдаём
+    // конвертеру те же байты. Без фильтра заранее читать нечего — `convert`
+    // прочитает файл сам, как и раньше.
+    let fb2_bytes = if lang.enabled {
         match fs::read(fb2) {
-            Ok(bytes) => {
-                let stats = crate::fb2epub::script_stats(&bytes);
-                if let Some(verdict) = lang.judge(&stats) {
-                    return Ok(BookOutcome::Foreign(Box::new(ForeignBook {
-                        id,
-                        title: meta.title.clone(),
-                        author: meta.authors.first().cloned().unwrap_or_default(),
-                        reason: verdict.reason(),
-                        stats,
-                    })));
-                }
+            Ok(bytes) => Some(bytes),
+            Err(err) => {
+                eprintln!(
+                    "[!] не удалось прочитать {} для проверки языка: {err}",
+                    fb2.display()
+                );
+                None
             }
-            Err(err) => eprintln!(
-                "[!] не удалось прочитать {} для проверки языка: {err}",
-                fb2.display()
-            ),
+        }
+    } else {
+        None
+    };
+    if lang.enabled {
+        if let Some(bytes) = &fb2_bytes {
+            let stats = crate::fb2epub::script_stats(bytes);
+            if let Some(verdict) = lang.judge(&stats) {
+                return Ok(BookOutcome::Foreign(Box::new(ForeignBook {
+                    id,
+                    title: meta.title.clone(),
+                    author: meta.authors.first().cloned().unwrap_or_default(),
+                    reason: verdict.reason(),
+                    stats,
+                })));
+            }
         }
     }
 
     // ---- конвертация: нативный конвертер, без внешних процессов ------------
     let t_phase = Instant::now();
-    let report = crate::fb2epub::convert(fb2, &converted)
-        .with_context(|| format!("не удалось сконвертировать {}", fb2.display()))?;
+    let report = match &fb2_bytes {
+        // Байты уже прочитаны для проверки языка — не читаем файл второй раз.
+        Some(bytes) => crate::fb2epub::convert_bytes(bytes, fb2, &converted),
+        None => crate::fb2epub::convert(fb2, &converted),
+    }
+    .with_context(|| format!("не удалось сконвертировать {}", fb2.display()))?;
     tally(&PROFILE.convert, t_phase);
     if fs::metadata(&converted)?.len() == 0 {
         bail!("конвертер создал пустой файл для {}", fb2.display());

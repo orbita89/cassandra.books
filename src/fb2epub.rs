@@ -1178,7 +1178,18 @@ pub fn decode_fb2(bytes: &[u8]) -> String {
 /// Сконвертировать FB2 в EPUB 3.3. Возвращает отчёт; ошибка вместо пустого файла.
 pub fn convert(fb2: &Path, out: &Path) -> Result<ConvertReport> {
     let bytes = fs::read(fb2).with_context(|| format!("не удалось прочитать {}", fb2.display()))?;
-    let xml = decode_fb2(&bytes);
+    convert_bytes(&bytes, fb2, out)
+}
+
+/// То же, но байты FB2 уже прочитаны вызывающим.
+///
+/// `fb2` нужен только для сообщений об ошибках: имя исходника в них полезнее,
+/// чем имя временного EPUB.
+///
+/// Нужно, когда файл пришлось прочитать раньше (проверка языка): FB2 на 20 МБ
+/// читался дважды — один раз ради статистики письма, второй раз здесь.
+pub fn convert_bytes(bytes: &[u8], fb2: &Path, out: &Path) -> Result<ConvertReport> {
+    let xml = decode_fb2(bytes);
     let root = parse_xml(&xml).with_context(|| format!("{}: не разобран FB2", fb2.display()))?;
     if root.name != "FictionBook" {
         bail!("{}: корневой элемент `{}`, а не `FictionBook`", fb2.display(), root.name);
