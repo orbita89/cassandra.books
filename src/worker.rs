@@ -483,6 +483,23 @@ fn run_import(
     // от оптимального по времени завершения.
     fb2_files.sort_by_cached_key(|p| std::cmp::Reverse(fs::metadata(p).map(|m| m.len()).unwrap_or(0)));
 
+    // Один входной ZIP — одна партия: одна папка обложек, один файл
+    // метаданных и один `.arx`. Имя — диапазон id, как у самого архива:
+    // `821884-821898`. Так на библиотеку в миллион книг будет столько
+    // каталогов, сколько было импортов, а не по одному на книгу.
+    let batch_name = {
+        let mut ids = fb2_files.iter().map(|p| parse_id(&file_stem(p)));
+        let first = ids.next().unwrap_or(0);
+        let (mut lo, mut hi) = (first, first);
+        for id in ids {
+            lo = lo.min(id);
+            hi = hi.max(id);
+        }
+        format!("{lo}-{hi}")
+    };
+    // Ссылка для потоков: сам `batch_name` нужен ещё в конце импорта.
+    let batch_ref = &batch_name;
+
     let _ = tx.send(WorkerMsg::Started {
         total,
         zip: zip
@@ -550,7 +567,8 @@ fn run_import(
                 .spawn_scoped(scope, move || loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     let Some(fb2) = fb2_files.get(i) else { break };
-                    let outcome = process_one(fb2, stage_dir, covers_dir, image, *lang);
+                    let outcome =
+                        process_one(fb2, stage_dir, covers_dir, batch_ref, image, *lang);
                     let n = done.fetch_add(1, Ordering::Relaxed) + 1;
                     match &outcome {
                         Ok(BookOutcome::Foreign(foreign)) => {
@@ -650,7 +668,9 @@ fn run_import(
     if !batch.is_empty() {
         let from_id = batch.iter().map(|b| b.id).min().unwrap_or(0);
         let to_id = batch.iter().map(|b| b.id).max().unwrap_or(0);
-        let archive_name = format!("{from_id}-{to_id}.arx");
+        // Имя архива — имя партии, а не диапазон удавшихся книг: папка
+        // обложек, файл метаданных и архив обязаны называться одинаково.
+        let archive_name = format!("{batch_name}.arx");
         let archive_path = archives_dir.join(&archive_name);
         let t_phase = Instant::now();
         pack_arx(&stage_dir, &archive_path, &settings.arx_compression)
@@ -673,7 +693,7 @@ fn run_import(
     // ---- шаг 4: индекс и метаданные ----------------------------------------
     let t_phase = Instant::now();
     let library = crate::db::Library::open(data_dir)?;
-    library.append_metadata(&all_books)?;
+    library.append_metadata(&batch_name, &all_books)?;
     {
         let mut writer = library.writer()?;
         library.index_books(&mut writer, &all_books)?;
@@ -713,6 +733,7 @@ fn process_one(
     fb2: &Path,
     work_dir: &Path,
     covers_dir: &Path,
+    batch: &str,
     cfg: &ImageOptConfig,
     lang: LangFilter,
 ) -> Result<BookOutcome> {
@@ -825,7 +846,7 @@ fn process_one(
     // из исходника стоило около 12 % всей процессорной работы импорта.
     let t_phase = Instant::now();
     let cover = match &summary.cover {
-        Some((source_name, bytes)) => Some(write_cover(covers_dir, id, source_name, bytes)?),
+        Some((source_name, bytes)) => Some(write_cover(covers_dir, batch, id, source_name, bytes)?),
         None => None,
     };
     tally(&PROFILE.cover, t_phase);
@@ -1357,31 +1378,33 @@ fn chapters_from_nav(xml: &str) -> Vec<String> {
 // Обложка
 // ---------------------------------------------------------------------------
 
-/// Положить обложку из готового EPUB в `data/covers/<id>.avif`.
+/// Положить обложку из готового EPUB в `data/covers/<партия>/<id>.avif`.
 ///
 /// Отдельного кодирования здесь нет намеренно: `optimize_epub` уже записала
 /// обложку в EPUB как AVIF с `cover_quality`. Второй проход (декодировать
 /// исходник, уменьшить, сжать заново) давал тот же кадр за ~12 % всего
 /// процессорного времени импорта.
 #[cfg(test)]
-fn save_cover(epub: &Path, id: u64, covers_dir: &Path) -> Result<Option<String>> {
+fn save_cover(epub: &Path, batch: &str, id: u64, covers_dir: &Path) -> Result<Option<String>> {
     let Some((source_name, bytes)) = images::cover_bytes(epub)? else {
         return Ok(None);
     };
-    Ok(Some(write_cover(covers_dir, id, &source_name, &bytes)?))
+    Ok(Some(write_cover(covers_dir, batch, id, &source_name, &bytes)?))
 }
 
-/// Записать байты обложки в `covers/<id%1000>/<id>.<ext>` и вернуть путь.
+/// Записать байты обложки в `covers/<партия>/<id>.<ext>` и вернуть путь.
 ///
 /// Расширение берём у настоящей записи EPUB, а не пишем `.avif` всегда:
 /// обложка теперь кодируется тем же форматом, что и остальные картинки, и
 /// файл `821884.avif` с содержимым WebP ломал бы определение формата.
 ///
-/// Обложки лежат в подкаталогах: на миллион книг плоский каталог — это
-/// миллион файлов в одном `readdir`, что плохо и для файловой системы, и
-/// для бэкапа. См. `db::Library::cover_rel_path`.
+/// Обложки лежат в папке своей партии импорта: один входной ZIP — одна
+/// папка (`821884-821898/821884.avif`). Плоский каталог на миллион книг —
+/// это миллион файлов в одном `readdir`, что плохо и для файловой системы,
+/// и для бэкапа. См. `db::Library::cover_rel_path`.
 fn write_cover(
     covers_dir: &Path,
+    batch: &str,
     id: u64,
     source_name: &str,
     bytes: &[u8],
@@ -1391,7 +1414,7 @@ fn write_cover(
         .next()
         .filter(|e| !e.is_empty() && *e != source_name)
         .unwrap_or("img");
-    let file_name = crate::db::Library::cover_rel_path(id, ext);
+    let file_name = crate::db::Library::cover_rel_path(batch, id, ext);
     if let Some(parent) = covers_dir.join(&file_name).parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1573,8 +1596,11 @@ mod summary_tests {
 
         // Путь и байты обложки — те же, что пишет `process_one`.
         let covers = dir.join("covers");
-        let written = save_cover(&epub, 7, &covers).unwrap().unwrap();
-        assert_eq!(written, crate::db::Library::cover_rel_path(7, "png"));
+        let written = save_cover(&epub, "1-2", 7, &covers).unwrap().unwrap();
+        assert_eq!(
+            written,
+            crate::db::Library::cover_rel_path("1-2", 7, "png")
+        );
         assert_eq!(fs::read(covers.join(&written)).unwrap(), bytes);
     }
 }

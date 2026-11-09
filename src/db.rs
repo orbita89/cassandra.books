@@ -2,7 +2,7 @@
 //!
 //! Метаданные живут в двух местах:
 //!   * `data/index/`      — индекс Tantivy (только для поиска);
-//!   * `data/metadata/NNN.jsonl` — полные метаданные, по файлу на 1000 книг;
+//!   * `data/metadata/<диапазон>.jsonl` — полные метаданные, по файлу на входной ZIP;
 //!     читаются в память целиком при старте.
 //!
 //! Tantivy используется исключительно как поисковый движок: по запросу он
@@ -24,13 +24,6 @@ use tantivy::{
 };
 
 /// Бюджет памяти Tantivy при индексации — не больше 50 МБ (требование ТЗ).
-/// На сколько файлов раскладываются метаданные.
-///
-/// 1000 — компромисс: на миллион книг это по 1000 книг (≈4 МБ) в файле, то
-/// есть чтение идёт тысячей последовательных чтений небольших файлов, а
-/// повреждение одного файла стоит одной тысячной каталога.
-pub const METADATA_SHARDS: u64 = 1000;
-
 pub const INDEX_MEMORY_BUDGET: usize = 50 * 1024 * 1024;
 
 /// Сколько результатов отдавать на один поисковый запрос по умолчанию.
@@ -256,11 +249,11 @@ impl Library {
     /// Каталог с метаданными: `data/metadata/`.
     ///
     /// Раньше всё лежало в одном `data/metadata.jsonl`. Один файл на
-    /// библиотеку в миллион книг — это 4 ГБ и одна точка отказа: любое
-    /// повреждение носителя уносит весь каталог, а не одну сотую. Поэтому
-    /// записи разложены по 1000 файлам `<id % 1000>.jsonl`: формат тот же
-    /// (по строке JSON на книгу), но повреждение или обрыв записи стоит
-    /// одной тысячной библиотеки, а не всей.
+    /// библиотеку в миллион книг — это 4 ГБ и одна точка отказа. Поэтому
+    /// записей несколько: по файлу на каждый входной ZIP, `<диапазон>.jsonl`.
+    /// Формат тот же (по строке JSON на книгу), но обрыв записи стоит одной
+    /// партии, а не всей библиотеки, и файлов ровно столько, сколько было
+    /// импортов, — а не по одному на книгу.
     pub fn metadata_dir(&self) -> PathBuf {
         self.data_dir.join("metadata")
     }
@@ -282,17 +275,16 @@ impl Library {
 
     /// Относительный путь обложки внутри `data/covers`.
     ///
-    /// Обложки раскладываются по подкаталогам, потому что один каталог на
-    /// библиотеку в миллион книг — это миллион файлов в одном `readdir`:
-    /// каталог перестаёт помещаться в кэш, `ls` и бэкап замедляются, а
-    /// некоторые инструменты (и сам ext4 на больших каталогах) начинают
-    /// работать заметно хуже. Ключ — `id % 1000`, чтобы файлы ложились
-    /// равномерно: на миллион книг это 1000 каталогов по 1000 файлов.
+    /// Один входной ZIP — одна папка (`821884-821898/821884.avif`), а не
+    /// отдельный каталог на книгу: на библиотеку в миллион книг плоский
+    /// каталог — это миллион файлов в одном `readdir`, а папка на книгу —
+    /// миллион каталогов. И то и другое плохо для файловой системы, `ls`
+    /// и бэкапа. Папок ровно столько, сколько было импортов.
     ///
-    /// Старые библиотеки, где обложки лежали плоско, продолжают работать:
-    /// путь просто не содержит подкаталога.
-    pub fn cover_rel_path(id: u64, ext: &str) -> String {
-        format!("{:03}/{id}.{ext}", id % 1000)
+    /// Старые библиотеки, где обложки лежали в `id % 1000`, продолжают
+    /// работать: путь хранится в метаданных книги, а не вычисляется заново.
+    pub fn cover_rel_path(batch: &str, id: u64, ext: &str) -> String {
+        format!("{batch}/{id}.{ext}")
     }
 
     /// Путь к `data/tmp`.
@@ -382,7 +374,7 @@ impl Library {
         Ok(removed)
     }
 
-    /// Перечитать метаданные в память: все шарды `data/metadata/*.jsonl`
+    /// Перечитать метаданные в память: все файлы `data/metadata/*.jsonl`
     /// плюс старый единый файл, если он остался с прошлых версий.
     pub fn reload_metadata(&mut self) -> Result<()> {
         self.books.clear();
@@ -475,36 +467,27 @@ impl Library {
         Ok(())
     }
 
-    /// Дописать книги в шарды `data/metadata/<id % 1000>.jsonl`.
+    /// Дописать книги в файл своей партии: `data/metadata/<диапазон>.jsonl`.
     ///
-    /// Запись идёт по одному шарду за раз, с `flush` на каждый: если процесс
-    /// убьют посреди импорта, потеряется максимум одна незавершённая строка,
-    /// а не весь батч. Дописывание в конец означает, что уже записанные книги
-    /// не пострадают ни при каком сбое.
-    pub fn append_metadata(&self, books: &[BookMetadata]) -> Result<()> {
-        use std::collections::BTreeMap;
+    /// Один входной ZIP — один файл, сколько бы книг в нём ни было. Запись
+    /// идёт с `flush` и `sync_all`: если процесс убьют посреди импорта,
+    /// потеряется максимум одна незавершённая строка, а не вся партия.
+    /// Дописывание в конец означает, что уже записанные книги не пострадают
+    /// ни при каком сбое.
+    pub fn append_metadata(&self, batch: &str, books: &[BookMetadata]) -> Result<()> {
         let dir = self.metadata_dir();
-        let mut shards: BTreeMap<u64, Vec<String>> = BTreeMap::new();
+        let path = dir.join(format!("{batch}.jsonl"));
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("не удалось открыть {}", path.display()))?;
         for book in books {
-            shards
-                .entry(book.id % METADATA_SHARDS)
-                .or_default()
-                .push(serde_json::to_string(book)?);
+            writeln!(file, "{}", serde_json::to_string(book)?)?;
         }
-        for (shard, lines) in shards {
-            let path = dir.join(format!("{shard:03}.jsonl"));
-            let mut file = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .with_context(|| format!("не удалось открыть {}", path.display()))?;
-            for line in lines {
-                writeln!(file, "{line}")?;
-            }
-            file.flush()?;
-            file.sync_all()
-                .with_context(|| format!("не удалось сбросить {}", path.display()))?;
-        }
+        file.flush()?;
+        file.sync_all()
+            .with_context(|| format!("не удалось сбросить {}", path.display()))?;
         Ok(())
     }
 
@@ -725,45 +708,62 @@ mod tests {
         }
     }
 
-    /// Обложки раскладываются по подкаталогам, а не лежат одной кучей.
+    /// Обложки лежат в папке своей партии импорта, а не одной кучей.
     #[test]
-    fn covers_are_sharded() {
-        assert_eq!(Library::cover_rel_path(821884, "avif"), "884/821884.avif");
-        assert_eq!(Library::cover_rel_path(1, "webp"), "001/1.webp");
-        // Миллион книг подряд не должен оказаться в одном каталоге.
-        let dirs: std::collections::HashSet<String> = (0..METADATA_SHARDS)
-            .map(|id| {
-                Library::cover_rel_path(id, "avif")
-                    .split('/')
-                    .next()
-                    .unwrap()
-                    .to_string()
-            })
-            .collect();
-        assert_eq!(dirs.len(), METADATA_SHARDS as usize);
+    fn covers_live_in_the_batch_folder() {
+        assert_eq!(
+            Library::cover_rel_path("821884-821898", 821884, "avif"),
+            "821884-821898/821884.avif"
+        );
+        assert_eq!(Library::cover_rel_path("1-2", 1, "webp"), "1-2/1.webp");
+        // Разные партии не перемешиваются.
+        assert_ne!(
+            Library::cover_rel_path("1-2", 1, "avif"),
+            Library::cover_rel_path("3-4", 1, "avif")
+        );
     }
 
-    /// Метаданные уезжают в шарды и читаются обратно, а единый файл не пишется.
+    /// Метаданные уезжают в файл партии и читаются обратно, а единый файл не пишется.
     #[test]
-    fn metadata_goes_to_shards_and_reads_back() -> Result<()> {
-        let dir = scratch("meta_shards");
+    fn metadata_goes_to_the_batch_file_and_reads_back() -> Result<()> {
+        let dir = scratch("meta_batch");
         let books: Vec<BookMetadata> = (1..=5u64).map(sample_book).collect();
         let meta_dir;
         {
             let lib = Library::open(&dir)?;
-            lib.append_metadata(&books)?;
+            lib.append_metadata("1-5", &books)?;
             meta_dir = lib.metadata_dir();
             assert!(
                 !lib.legacy_metadata_path().exists(),
                 "единый metadata.jsonl больше не создаётся"
             );
         }
+        // Один входной ZIP — один файл, сколько бы книг в нём ни было.
         let files = fs::read_dir(&meta_dir)?.count();
-        assert_eq!(files, 5, "пять книг с id 1..5 — пять разных шардов");
+        assert_eq!(files, 1, "пять книг одной партии — один файл");
+        assert!(meta_dir.join("1-5.jsonl").exists());
 
         let lib = Library::open(&dir)?;
         assert_eq!(lib.books.len(), 5);
         assert_eq!(lib.books[&3].title, "Книга 3");
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Две партии — два файла, и обе читаются.
+    #[test]
+    fn two_batches_are_two_files() -> Result<()> {
+        let dir = scratch("meta_two_batches");
+        let meta_dir;
+        {
+            let lib = Library::open(&dir)?;
+            lib.append_metadata("1-3", &(1..=3u64).map(sample_book).collect::<Vec<_>>())?;
+            lib.append_metadata("4-6", &(4..=6u64).map(sample_book).collect::<Vec<_>>())?;
+            meta_dir = lib.metadata_dir();
+        }
+        assert_eq!(fs::read_dir(&meta_dir)?.count(), 2);
+        let lib = Library::open(&dir)?;
+        assert_eq!(lib.books.len(), 6);
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
@@ -792,11 +792,11 @@ mod tests {
         let meta_dir;
         {
             let lib = Library::open(&dir)?;
-            lib.append_metadata(&(1..=3u64).map(sample_book).collect::<Vec<_>>())?;
+            lib.append_metadata("1-3", &(1..=3u64).map(sample_book).collect::<Vec<_>>())?;
             meta_dir = lib.metadata_dir();
         }
         // Портим одну запись, как это сделал бы оборванный на середине импорт.
-        let shard = meta_dir.join(format!("{:03}.jsonl", 2 % METADATA_SHARDS));
+        let shard = meta_dir.join("1-3.jsonl");
         let mut text = fs::read_to_string(&shard)?;
         text.push_str("{\"id\": 999, \"title\": \"оборва");
         fs::write(&shard, text)?;

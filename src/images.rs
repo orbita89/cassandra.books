@@ -328,7 +328,7 @@ impl Default for ImageOptConfig {
             // это −0.4 % размера за 3.8x времени, поэтому стоит speed 2.
             max_w: 480,
             max_h: 720,
-            shrink_percent: 55.0,
+            shrink_percent: 45.0,
             quality: 35.0,
             method: 4,
             min_side: 240,
