@@ -1877,11 +1877,16 @@ fn process_images(input: &Path, cfg: &ImageOptConfig) -> Result<ImageStage> {
         .filter(|(_, r)| **r)
         .map(|(i, _)| i)
         .collect();
-    let raster_names: Vec<&str> = raster_idx
-        .iter()
-        .map(|&i| entries[i].0.as_str())
-        .collect();
     let encoded = encode_all(&entries, &raster_idx, cover_name.as_deref(), cfg);
+
+    // `encode_all` уже дождался всех заданий: канал `done_rx` закрывается
+    // только вместе с последним замыканием, а оно держит `Arc`, — значит,
+    // клонов больше нет и `Arc` разворачивается. Дальше байты перемещаются,
+    // а не копируются: у книги с 5 МБ текста это лишние 5 МБ `memcpy`.
+    let entries = match Arc::try_unwrap(entries) {
+        Ok(v) => v,
+        Err(arc) => (*arc).clone(),
+    };
 
     let mut stats = ImageOptStats::default();
     let mut used_names: HashSet<String> = entries.iter().map(|(n, _)| n.clone()).collect();
@@ -1891,15 +1896,15 @@ fn process_images(input: &Path, cfg: &ImageOptConfig) -> Result<ImageStage> {
 
     // Имена выдаются последовательно: результат не должен зависеть от того,
     // в каком порядке потоки закончили кодирование.
-    let mut enc_iter = raster_names.into_iter().zip(encoded);
+    let mut enc_iter = encoded.into_iter();
 
-    for (i, (name, data)) in entries.iter().enumerate() {
+    for (i, (name, data)) in entries.into_iter().enumerate() {
         if !is_raster[i] {
-            out_entries.push((name.clone(), data.clone()));
+            out_entries.push((name, data));
             continue;
         }
 
-        let Some((_, result)) = enc_iter.next() else {
+        let Some(result) = enc_iter.next() else {
             bail!("внутренняя ошибка: нет результата кодирования для `{name}`");
         };
 
@@ -1910,7 +1915,7 @@ fn process_images(input: &Path, cfg: &ImageOptConfig) -> Result<ImageStage> {
             // Картинка не декодировалась — оставляем байты как есть.
             stats.failed += 1;
             stats.bytes_after += data.len() as u64;
-            out_entries.push((name.clone(), data.clone()));
+            out_entries.push((name, data));
             continue;
         };
 
@@ -1936,23 +1941,23 @@ fn process_images(input: &Path, cfg: &ImageOptConfig) -> Result<ImageStage> {
 
         // --- новое имя -------------------------------------------------------
         let ext = enc.format.ext();
-        used_names.remove(name);
-        let candidate_name = if ext_lower(name) == ext {
+        used_names.remove(&name);
+        let candidate_name = if ext_lower(&name) == ext {
             name.clone()
         } else {
-            format!("{}.{}", strip_ext(name), ext)
+            format!("{}.{}", strip_ext(&name), ext)
         };
         let mut final_name = candidate_name.clone();
         let mut n = 1;
         while used_names.contains(&final_name) {
-            final_name = format!("{}.{}.{}", strip_ext(name), n, ext);
+            final_name = format!("{}.{}.{}", strip_ext(&name), n, ext);
             n += 1;
         }
         used_names.insert(final_name.clone());
 
-        if final_name != *name {
+        if final_name != name {
             renames.push((
-                basename(name).to_string(),
+                basename(&name).to_string(),
                 basename(&final_name).to_string(),
                 enc.format.mime().to_string(),
             ));
