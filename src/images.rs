@@ -1552,8 +1552,10 @@ fn encode_image(
 
     let speed = pick_avif_speed(w, h, graphic, is_cover, cfg);
 
-    // Серость и прозрачность не меняются при ресайзе. Считаем один раз
-    // на исходном кадре, а не на каждом кандидате лестницы.
+    // Признаки исходного кадра — для кандидата без уменьшения (там кадр тот
+    // же самый). На уменьшенном кадре их приходится считать заново: Lanczos3
+    // и unsharpen меняют и серость, и «альфа 255 везде» у части картинок —
+    // проверено сравнением байт EPUB, признак с исходника даёт другой файл.
     let (gray_src, opaque_src) = image_kind(&rgba);
 
     // --- основной путь: AVIF -------------------------------------------------
@@ -1565,21 +1567,28 @@ fn encode_image(
         let mut avif: Option<Candidate> = None;
         for &scale in &ladder {
             let (nw, nh) = dims_at_scale(w, h, scale);
+            let shrunk = (nw, nh) != (w, h);
             let t_resize = std::time::Instant::now();
-            let resized = if (nw, nh) == (w, h) {
-                rgba.clone()
-            } else {
+            let resized = if shrunk {
                 image::imageops::resize(&rgba, nw, nh, FilterType::Lanczos3)
+            } else {
+                rgba.clone()
             };
             // Графика после уменьшения теряет резкость краёв — подчёркиваем их.
-            let prepped = if graphic && (nw, nh) != (w, h) {
+            let prepped = if graphic && shrunk {
                 image::imageops::unsharpen(&resized, 0.7, 2)
             } else {
                 resized
             };
             tally_ns(&RESIZE_NS, t_resize);
-            let cand = match avif_candidate(&prepped, nw, nh, quality, speed, gray_src, opaque_src)
-            {
+            // Кадр не менялся — годится признак исходника; менялся — считаем
+            // заново, но по-прежнему одним проходом по пикселям.
+            let (gray, opaque) = if shrunk {
+                image_kind(&prepped)
+            } else {
+                (gray_src, opaque_src)
+            };
+            let cand = match avif_candidate(&prepped, nw, nh, quality, speed, gray, opaque) {
                 Ok(c) => c,
                 Err(err) => {
                     eprintln!("    [!] AVIF не удался для `{name}`: {err} — беру WebP");
@@ -1587,7 +1596,6 @@ fn encode_image(
                 }
             };
             // Штрих измеряем только там, где картинка реально уменьшалась.
-            let shrunk = (nw, nh) != (w, h);
             let t_stroke = std::time::Instant::now();
             let ok = single
                 || !graphic
