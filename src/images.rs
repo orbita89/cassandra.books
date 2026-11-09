@@ -33,7 +33,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use image::imageops::FilterType;
 use image::{ExtendedColorType, ImageEncoder, RgbaImage};
 use libwebp_sys::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -81,6 +81,18 @@ pub static LARGE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 pub static SMALL_AVIF_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Наносекунды AVIF-кодирования крупных картинок.
 pub static LARGE_AVIF_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+// --- дедупликация картинок -------------------------------------------------
+
+/// Сколько раз картинка оказалась байт-в-байт копией уже записанной.
+pub static DEDUP_IMAGES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Сколько байт сэкономлено на этих копиях.
+pub static DEDUP_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Сколько картинок осталось в исходном виде: перекодировать их невыгодно.
+pub static KEPT_ORIGINAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Сколько байт удалось на этом сэкономить.
+pub static KEPT_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 // --- встроенные шрифты -----------------------------------------------------
 
@@ -416,6 +428,14 @@ pub struct ImageOptStats {
     pub bytes_before: u64,
     /// Суммарный размер картинок после оптимизации.
     pub bytes_after: u64,
+    /// Сколько картинок оказалось копиями уже записанных (не записаны второй раз).
+    pub images_dedup: usize,
+    /// Сколько байт сэкономлено на этих копиях.
+    pub bytes_dedup: u64,
+    /// Сколько картинок оставлено как есть: наша перекодировка вышла крупнее.
+    pub kept_original: usize,
+    /// Сколько байт на этом сэкономлено.
+    pub kept_bytes: u64,
     /// Максимальная ширина/высота до и после.
     pub max_before: (u32, u32),
     pub max_after: (u32, u32),
@@ -1395,6 +1415,17 @@ struct Encoded {
     before_h: u32,
 }
 
+/// Отпечаток байтов картинки — чтобы найти одинаковые файлы в одной книге.
+///
+/// Хеш нужен только как быстрый фильтр: при совпадении байты сравниваются
+/// целиком, поэтому даже теоретическое совпадение хешей ничего не испортит.
+fn fingerprint_of(data: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    data.hash(&mut h);
+    h.finish()
+}
+
 /// Один вариант кодирования.
 struct Candidate {
     data: Vec<u8>,
@@ -1412,8 +1443,6 @@ const SMALL_SHRINK: f64 = 10.0;
 /// Качество кодирования: обложка → `cover_quality`, мелкая → `quality_small`.
 ///
 /// Порог — строго «меньше `small_px`»: картинка 300x900 уже считается обычной.
-
-/// Выбрать качество кодирования для конкретной картинки.
 fn pick_quality(w: u32, h: u32, cfg: &ImageOptConfig, is_cover: bool) -> f32 {
     if is_cover {
         cfg.cover_quality
@@ -2041,6 +2070,10 @@ fn process_images(input: &Path, cfg: &ImageOptConfig) -> Result<ImageStage> {
     let mut used_names: HashSet<String> = entries.iter().map(|(n, _)| n.clone()).collect();
     // (старое basename, новое basename, MIME) — по basename, как их видят ссылки.
     let mut renames: Vec<(String, String, String)> = Vec::new();
+    // Отпечаток содержимого → индекс записи в `out_entries`. В книге нередко
+    // лежат байт-в-байт копии одной картинки (рамки, буквицы, повторы
+    // иллюстраций); вторую копию не пишем, а ссылки переводим на первую.
+    let mut seen_images: HashMap<u64, usize> = HashMap::new();
     let mut out_entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(entries.len());
 
     // Имена выдаются последовательно: результат не должен зависеть от того,
@@ -2067,6 +2100,20 @@ fn process_images(input: &Path, cfg: &ImageOptConfig) -> Result<ImageStage> {
             out_entries.push((name, data));
             continue;
         };
+
+        // Наша перекодировка вышла крупнее исходника — значит, сжимать тут
+        // нечего, и единственное, что она даёт, это потерю качества. Такое
+        // бывает на уже хорошо сжатых JPEG и на мелких PNG: исходник
+        // остаётся как есть, вместе со своим именем и ссылками.
+        if enc.data.len() >= data.len() {
+            stats.kept_original += 1;
+            stats.kept_bytes += (enc.data.len() - data.len()) as u64;
+            stats.bytes_after += data.len() as u64;
+            KEPT_ORIGINAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            KEPT_BYTES.fetch_add((enc.data.len() - data.len()) as u64, std::sync::atomic::Ordering::Relaxed);
+            out_entries.push((name, data));
+            continue;
+        }
 
         stats.max_before = (
             stats.max_before.0.max(enc.before_w),
@@ -2103,6 +2150,30 @@ fn process_images(input: &Path, cfg: &ImageOptConfig) -> Result<ImageStage> {
             n += 1;
         }
         used_names.insert(final_name.clone());
+
+        // Копия уже записанной картинки? Тогда запись не нужна: достаточно
+        // перевести ссылки на ту, что уже лежит в книге. Хеш проверяем
+        // сравнением байтов, поэтому потерять другую картинку невозможно.
+        let fingerprint = fingerprint_of(&enc.data);
+        if let Some(&kept_idx) = seen_images.get(&fingerprint) {
+            if out_entries[kept_idx].1 == enc.data {
+                let kept = out_entries[kept_idx].0.clone();
+                if basename(&name) != basename(&kept) {
+                    renames.push((
+                        basename(&name).to_string(),
+                        basename(&kept).to_string(),
+                        enc.format.mime().to_string(),
+                    ));
+                }
+                stats.images_dedup += 1;
+                stats.bytes_dedup += enc.data.len() as u64;
+                DEDUP_IMAGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                DEDUP_BYTES.fetch_add(enc.data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                used_names.remove(&final_name);
+                continue;
+            }
+        }
+        seen_images.insert(fingerprint, out_entries.len());
 
         if final_name != name {
             renames.push((

@@ -19,7 +19,7 @@ use crate::images::{self, ImageOptConfig};
 use anyhow::{bail, Context, Result};
 use crossbeam_channel::Sender;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -150,6 +150,23 @@ fn profile_text(cores: usize, cfg: &ImageOptConfig) -> String {
         g(&im::SMALL_AVIF_NS),
         cfg.small_avif_speed,
     ));
+    let kept = calls(&im::KEPT_ORIGINAL);
+    if kept > 0 {
+        s.push_str(&format!(
+            "  оставлено исходными (наша версия крупнее): {:>4} шт, экономия {:>7.1} МБ\n",
+            kept,
+            mb(im::KEPT_BYTES.load(Ordering::Relaxed)),
+        ));
+    }
+    let dedup = calls(&im::DEDUP_IMAGES);
+    if dedup > 0 {
+        s.push_str(&format!(
+            "  копий одной картинки внутри книги:      {:>6} шт, не записаны повторно, \
+             экономия {:>7.1} МБ\n",
+            dedup,
+            mb(im::DEDUP_BYTES.load(Ordering::Relaxed)),
+        ));
+    }
     s.push_str(&format!(
         "  крупные (остальные):                    {:>6} шт, {:>7.1} МБ исходников, \
          AVIF {:>7.1} с (обычная скорость)\n",
@@ -188,6 +205,79 @@ fn profile_text(cores: usize, cfg: &ImageOptConfig) -> String {
 /// Пишется всегда, а не по переменной окружения: это единственный след того,
 /// сколько импорт занял и на что ушло время. Файл маленький (пара килобайт),
 /// поэтому жалеть его незачем.
+/// Убрать из списка книги, побайтно совпадающие с уже оставленной.
+///
+/// Возвращает пары `(id копии, id оригинала)` — для отчёта. Файлы сначала
+/// группируются по размеру: у разных размеров копий быть не может, поэтому
+/// читать приходится только внутри групп, а обычно это один файл.
+fn drop_identical(fb2_files: &mut Vec<PathBuf>) -> Vec<(u64, u64)> {
+    let mut by_size: std::collections::HashMap<u64, Vec<usize>> = std::collections::HashMap::new();
+    for (i, p) in fb2_files.iter().enumerate() {
+        let size = fs::metadata(p).map(|m| m.len()).unwrap_or(u64::MAX);
+        by_size.entry(size).or_default().push(i);
+    }
+
+    let mut dropped = vec![false; fb2_files.len()];
+    let mut copies: Vec<(u64, u64)> = Vec::new();
+    for idxs in by_size.values() {
+        if idxs.len() < 2 {
+            continue;
+        }
+        for (k, &i) in idxs.iter().enumerate() {
+            for &j in &idxs[..k] {
+                if dropped[j] {
+                    continue;
+                }
+                if same_file(&fb2_files[i], &fb2_files[j]) {
+                    dropped[i] = true;
+                    copies.push((
+                        parse_id(&file_stem(&fb2_files[i])),
+                        parse_id(&file_stem(&fb2_files[j])),
+                    ));
+                    break;
+                }
+            }
+        }
+    }
+    if copies.is_empty() {
+        return copies;
+    }
+
+    let mut i = 0usize;
+    fb2_files.retain(|_| {
+        let keep = !dropped[i];
+        i += 1;
+        keep
+    });
+    copies
+}
+
+/// Совпадают ли два файла побайтно. Читаем кусками: книги бывают по 59 МБ, и
+/// держать две такие в памяти только ради сравнения незачем.
+fn same_file(a: &Path, b: &Path) -> bool {
+    let (Ok(mut fa), Ok(mut fb)) = (fs::File::open(a), fs::File::open(b)) else {
+        return false;
+    };
+    let mut ba = vec![0u8; 64 * 1024];
+    let mut bb = vec![0u8; 64 * 1024];
+    loop {
+        let na = match fa.read(&mut ba) {
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        let nb = match fb.read(&mut bb) {
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        if na != nb || ba[..na] != bb[..nb] {
+            return false;
+        }
+        if na == 0 {
+            return true;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_import_log(
     data_dir: &Path,
@@ -198,6 +288,7 @@ fn write_import_log(
     failed: usize,
     skipped: usize,
     foreign: &[ForeignBook],
+    duplicates: &[(u64, u64)],
 ) {
     let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
     let mut s = String::new();
@@ -259,6 +350,20 @@ fn write_import_log(
                 f.stats.cyrillic_share() * 100.0,
                 f.stats.foreign_share() * 100.0,
             ));
+        }
+    }
+
+    // Байт-в-байт копии книг: их не обрабатывали вовсе, но в отчёте они
+    // должны быть — иначе «книг обработано» не сойдётся с числом файлов.
+    if !duplicates.is_empty() {
+        s.push('\n');
+        s.push_str("Не попали в архив: побайтные копии книг из этого же импорта\n");
+        s.push_str("=============================================================\n");
+        s.push_str(
+            "Файлы совпадают полностью, поэтому обработан только первый из них.\n\n",
+        );
+        for (copy, original) in duplicates {
+            s.push_str(&format!("{copy} | копия книги {original}\n"));
         }
     }
 
@@ -498,6 +603,13 @@ fn run_import(
     if fb2_files.is_empty() {
         bail!("в архиве {} не найдено ни одного .fb2", zip.display());
     }
+
+    // ---- шаг 1b: байт-в-байт копии -----------------------------------------
+    // В корпусах попадаются двойники: один и тот же файл, приехавший в разных
+    // ZIP. Второй раз его обрабатывать незачем — это и время, и лишний дубль
+    // в библиотеке. Сравниваем только файлы одного размера: у разных размеров
+    // копий быть не может, а чтение всего корпуса — это лишние минуты.
+    let duplicates = drop_identical(&mut fb2_files);
     let total = fb2_files.len();
 
     // Порядок обработки — от больших книг к маленьким (LPT).
@@ -745,6 +857,7 @@ fn run_import(
         failed.load(Ordering::Relaxed),
         skipped.load(Ordering::Relaxed),
         &foreign,
+        &duplicates,
     );
     let _ = tx.send(WorkerMsg::Finished {
         books: all_books.len(),
