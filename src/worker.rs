@@ -141,12 +141,13 @@ fn profile_text(cores: usize, cfg: &ImageOptConfig) -> String {
         large
     ));
     s.push_str(&format!(
-        "  мелкие  (вес < {} КБ или сторона < {}): {:>6} шт, {:>7.1} МБ исходников, \
-         AVIF {:>7.1} с (скорость {})\n",
+        "  мелкие  (вес < {} КБ или сторона < {}): {:>6} шт, {:>7.1} МБ исходников \
+         → {:>6.1} МБ в книгах, AVIF {:>7.1} с (скорость {})\n",
         cfg.small_bytes / 1024,
         cfg.small_px,
         small,
         mb(im::SMALL_BYTES.load(Ordering::Relaxed)),
+        mb(im::SMALL_OUT_BYTES.load(Ordering::Relaxed)),
         g(&im::SMALL_AVIF_NS),
         cfg.small_avif_speed,
     ));
@@ -176,12 +177,48 @@ fn profile_text(cores: usize, cfg: &ImageOptConfig) -> String {
         ));
     }
     s.push_str(&format!(
-        "  крупные (остальные):                    {:>6} шт, {:>7.1} МБ исходников, \
-         AVIF {:>7.1} с (обычная скорость)\n",
+        "  крупные (остальные):                    {:>6} шт, {:>7.1} МБ исходников \
+         → {:>6.1} МБ в книгах, AVIF {:>7.1} с (обычная скорость)\n",
         large,
         mb(im::LARGE_BYTES.load(Ordering::Relaxed)),
+        mb(im::LARGE_OUT_BYTES.load(Ordering::Relaxed)),
         g(&im::LARGE_AVIF_NS),
     ));
+    let out_small = im::SMALL_OUT_BYTES.load(Ordering::Relaxed);
+    let out_large = im::LARGE_OUT_BYTES.load(Ordering::Relaxed);
+    s.push_str(&format!(
+        "  вес всех картинок в книгах:             {:>6.1} МБ (мелкие {:.0} %, крупные {:.0} %)\n",
+        mb(out_small + out_large),
+        if out_small + out_large > 0 {
+            out_small as f64 / (out_small + out_large) as f64 * 100.0
+        } else {
+            0.0
+        },
+        if out_small + out_large > 0 {
+            out_large as f64 / (out_small + out_large) as f64 * 100.0
+        } else {
+            0.0
+        },
+    ));
+
+    // Почти-дубликаты: одна и та же картинка в разных книгах. Это счётчик, а
+    // не сжатие — EPUB обязан быть самодостаточным, поэтому копии остаются.
+    // Но по числу видно, сколько сняло бы общее хранилище картинок.
+    let perceptual = calls(&im::PERCEPTUAL_IMAGES);
+    if perceptual > 0 {
+        s.push_str(&format!(
+            "  почти-дубликаты (перцептивный хеш):     {:>6} из {perceptual} шт, {:>6.1} МБ в готовом виде\n",
+            calls(&im::NEAR_DUP_IMAGES),
+            mb(im::NEAR_DUP_BYTES.load(Ordering::Relaxed)),
+        ));
+        s.push_str(
+            "    это одна и та же картинка в разных книгах; столько снимет общее хранилище,\n    \
+             где такая картинка лежит в единственном экземпляре\n",
+        );
+        if calls(&im::PERCEPTUAL_LIMIT) > 0 {
+            s.push_str("    (набор хешей заполнен, дальше копии не считались)\n");
+        }
+    }
 
     // Шрифты: если их в корпусе нет, так и пишем — иначе строка «0 Б → 0 Б»
     // выглядит как сломанный subsetting, хотя это его отсутствие.
@@ -561,6 +598,9 @@ fn run_import(
     tx: &Sender<WorkerMsg>,
 ) -> Result<()> {
     let started = Instant::now();
+    // Счётчики профиля и набор перцептивных хешей — на один импорт: в GUI их
+    // может быть несколько подряд, и второй отчёт иначе показывал бы сумму.
+    images::reset_profile();
     if !zip.exists() {
         bail!("входной архив не найден: {}", zip.display());
     }

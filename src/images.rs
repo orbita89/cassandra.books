@@ -89,6 +89,138 @@ pub static DEDUP_IMAGES: std::sync::atomic::AtomicUsize = std::sync::atomic::Ato
 /// Сколько байт сэкономлено на этих копиях.
 pub static DEDUP_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Сколько весят в книгах мелкие картинки (после обработки).
+pub static SMALL_OUT_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Сколько весят в книгах крупные картинки (после обработки).
+pub static LARGE_OUT_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+// --- почти-дубликаты -------------------------------------------------------
+//
+// Побайтные копии внутри книги убираются на месте (`DEDUP_*`), а одинаковые
+// картинки в **разных** книгах хранятся каждая своей копией: EPUB обязан быть
+// самодостаточным. Перцептивный хеш нужен, чтобы понять, сколько таких копий
+// вообще есть — это нижняя оценка того, что сняло бы общее хранилище картинок.
+//
+// Это только счётчик: ничего не удаляется и не заменяется.
+
+/// Сколько картинок прошло через перцептивный хеш.
+pub static PERCEPTUAL_IMAGES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Сколько из них оказалось копией уже встреченной.
+pub static NEAR_DUP_IMAGES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Сколько весят эти копии в готовом виде.
+pub static NEAR_DUP_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Заполнился ли набор хешей (дальше копии не считаются).
+pub static PERCEPTUAL_LIMIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Сколько перцептивных хешей держим в памяти.
+///
+/// 8 байт на картинку: 4 млн — это десятки мегабайт. Больше не нужно: на
+/// корпусе в сотни тысяч книг набор всё равно перестаёт что-либо значить, а
+/// память нужна кодировщикам.
+const PERCEPTUAL_CAP: usize = 4_000_000;
+
+static PERCEPTUAL_SEEN: std::sync::OnceLock<std::sync::Mutex<HashSet<u64>>> =
+    std::sync::OnceLock::new();
+
+/// Перцептивный хеш картинки: 64 бита «где светлее, где темнее».
+///
+/// Кадр приводится к 9x8 в оттенках серого и сравнивается попарно по
+/// горизонтали. Такой хеш не зависит от масштаба и переживает слабое
+/// перекодирование, поэтому одинаковые иллюстрации в разных книгах дают одно
+/// и то же значение. Он не криптографический: нужна устойчивость, а не
+/// защита от подделки.
+fn perceptual_hash(img: &RgbaImage) -> u64 {
+    const W: u32 = 9;
+    const H: u32 = 8;
+    let small = image::imageops::resize(img, W, H, FilterType::Triangle);
+    let luma = |p: &image::Rgba<u8>| -> u32 {
+        let a = u32::from(p[3]);
+        let mix = |c: u8| (u32::from(c) * a + 255 * (255 - a)) / 255;
+        (mix(p[0]) * 299 + mix(p[1]) * 587 + mix(p[2]) * 114) / 1000
+    };
+    let mut hash = 0u64;
+    let mut bit = 0;
+    for y in 0..H {
+        for x in 0..(W - 1) {
+            if luma(small.get_pixel(x, y)) > luma(small.get_pixel(x + 1, y)) {
+                hash |= 1 << bit;
+            }
+            bit += 1;
+        }
+    }
+    hash
+}
+
+/// Запомнить хеш. `true`, если ровно такой уже встречался в этом импорте.
+fn register_perceptual(hash: u64) -> bool {
+    PERCEPTUAL_IMAGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let seen = PERCEPTUAL_SEEN.get_or_init(|| std::sync::Mutex::new(HashSet::new()));
+    let Ok(mut seen) = seen.lock() else {
+        return false;
+    };
+    if seen.contains(&hash) {
+        return true;
+    }
+    if seen.len() < PERCEPTUAL_CAP {
+        seen.insert(hash);
+    } else {
+        PERCEPTUAL_LIMIT.store(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    false
+}
+
+/// Обнулить счётчики профиля перед импортом.
+///
+/// В одном процессе импортов может быть несколько (GUI), и без сброса второй
+/// отчёт показывал бы сумму с первым, а набор перцептивных хешей тянул бы
+/// картинки из прошлого импорта.
+pub fn reset_profile() {
+    use std::sync::atomic::Ordering::Relaxed;
+    for a in [
+        &DECODE_NS,
+        &FEATURES_NS,
+        &RESIZE_NS,
+        &AVIF_NS,
+        &WEBP_NS,
+        &STROKE_NS,
+        &SMALL_AVIF_NS,
+        &LARGE_AVIF_NS,
+        &SMALL_BYTES,
+        &LARGE_BYTES,
+        &SMALL_OUT_BYTES,
+        &LARGE_OUT_BYTES,
+        &FONTS_BEFORE,
+        &FONTS_AFTER,
+        &DEDUP_BYTES,
+        &TRIMMED_PIXELS,
+        &ADAPTIVE_SAVED,
+        &NEAR_DUP_BYTES,
+    ] {
+        a.store(0, Relaxed);
+    }
+    for a in [
+        &AVIF_CALLS,
+        &WEBP_CALLS,
+        &SMALL_IMAGES,
+        &LARGE_IMAGES,
+        &FONTS_FILES,
+        &FONTS_SUBSET,
+        &DEDUP_IMAGES,
+        &TRIMMED_IMAGES,
+        &ADAPTIVE_IMAGES,
+        &NEAR_DUP_IMAGES,
+        &PERCEPTUAL_IMAGES,
+        &PERCEPTUAL_LIMIT,
+    ] {
+        a.store(0, Relaxed);
+    }
+    if let Some(seen) = PERCEPTUAL_SEEN.get() {
+        if let Ok(mut seen) = seen.lock() {
+            seen.clear();
+        }
+    }
+}
+
 // --- обрезка полей ---------------------------------------------------------
 
 /// Сколько картинок удалось обрезать по однотонным полям.
@@ -1518,6 +1650,10 @@ struct Encoded {
     lossless: bool,
     /// Выиграл ли near-lossless-вариант.
     near_lossless: bool,
+    /// Считалась ли картинка мелкой (по исходнику).
+    small: bool,
+    /// Встречалась ли такая картинка в этом импорте раньше (перцептивный хеш).
+    near_dup: bool,
     /// Уменьшалась ли картинка.
     resized: bool,
     /// Исходные размеры (нужны для статистики).
@@ -1823,6 +1959,11 @@ fn encode_image(
     };
     let (w, h) = (rgba.width(), rgba.height());
 
+    // Перцептивный хеш — по тому же кадру, что пойдёт в книгу. Считается
+    // всегда (это одна миниатюра 9x8), а решение о копии принимается по нему
+    // уже здесь, чтобы признак попал в статистику готовых картинок.
+    let near_dup = register_perceptual(perceptual_hash(&rgba));
+
     // Графика (текст, схемы) и фотографии сжимаются по-разному: у графики при
     // уменьшении слипаются штрихи, и текст перестаёт читаться.
     tally_ns(&DECODE_NS, t_decode);
@@ -2026,6 +2167,8 @@ fn encode_image(
                 h: cand.h,
                 lossless: cand.lossless,
                 near_lossless: cand.near_lossless,
+                small,
+                near_dup,
                 before_w: orig_w,
                 before_h: orig_h,
             }));
@@ -2064,6 +2207,8 @@ fn encode_image(
         h: best.h,
         lossless: best.lossless,
         near_lossless: best.near_lossless,
+        small,
+        near_dup,
         resized: best.w != orig_w || best.h != orig_h,
         before_w: orig_w,
         before_h: orig_h,
@@ -2399,6 +2544,18 @@ fn process_images(input: &Path, cfg: &ImageOptConfig) -> Result<ImageStage> {
             }
         }
         seen_images.insert(fingerprint, out_entries.len());
+
+        // Куда именно уходит вес: мелкие и крупные картинки порознь. Без
+        // этого в отчёте видно только время, и непонятно, что сжимать.
+        if enc.small {
+            SMALL_OUT_BYTES.fetch_add(enc.data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            LARGE_OUT_BYTES.fetch_add(enc.data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        if enc.near_dup {
+            NEAR_DUP_IMAGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            NEAR_DUP_BYTES.fetch_add(enc.data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
 
         if final_name != name {
             renames.push((
