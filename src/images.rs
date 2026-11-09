@@ -2,8 +2,9 @@
 //!
 //! Что делает:
 //!   * достаёт из EPUB **все** растровые картинки (jpeg/png/gif/bmp/tiff/webp/avif);
-//!   * уменьшает каждую на `shrink_percent` процентов от исходного
-//!     разрешения (по умолчанию 20 %, лимита по размеру нет) и меняет формат;
+//!   * уменьшает крупные картинки на `shrink_percent` процентов от исходного
+//!     разрешения (по умолчанию 35 %, лимита по размеру нет), а мелкие не
+//!     уменьшает вовсе — оставляет исходное разрешение;
 //!   * перебирает несколько вариантов и берёт самый маленький по байтам:
 //!     WebP lossy (quality 35, а для мелких картинок — 48), WebP near-lossless
 //!     (для png/gif/bmp/tiff, `near_lossless=60`) и AVIF lossy (через `ravif`,
@@ -331,9 +332,10 @@ impl Default for ImageOptConfig {
             // подрезается под 480x720, как было раньше.
             max_w: 0,
             max_h: 0,
-            // Уменьшение на 20 % от исходного разрешения. Прежние 55 %
-            // съедали больше половины пикселей, и картинки выглядели мылом.
-            shrink_percent: 20.0,
+            // Крупные картинки уменьшаются на 35 % от исходного разрешения.
+            // Мелкие (мало байт или меньше 300 px по стороне) не уменьшаются
+            // вовсе — см. `is_small_image` в `encode_image`.
+            shrink_percent: 35.0,
             quality: 35.0,
             method: 4,
             min_side: 240,
@@ -1581,11 +1583,19 @@ fn encode_image(
             .min(1.0)
     };
 
+    // Мелкая картинка — мало байт или мало пикселей (см. `is_small_image`).
+    // Такие не уменьшаем совсем: пикселей у них и так немного, а в исходном
+    // разрешении они заметно чище и почти ничего не весят.
+    let small = is_small_image(data.len(), w, h, cfg);
+
     // Сколько уменьшать, с каким качеством и ниже какого масштаба нельзя.
     let (shrink, quality, floor, min_scale) = if is_cover {
-        // Обложку уменьшаем так же, как всё остальное: на `shrink_percent`.
-        let target = 1.0 - cfg.shrink_percent / 100.0;
-        (cfg.shrink_percent, cfg.cover_quality, target.max(0.5), 0.0)
+        // Обложку уменьшаем как крупную картинку, мелкую не трогаем.
+        let s = if small { 0.0 } else { cfg.shrink_percent };
+        (s, cfg.cover_quality, (1.0 - s / 100.0).max(0.5), 0.0)
+    } else if small {
+        // Мелкие — в исходном разрешении, с полом 1.0 (уменьшать некуда).
+        (0.0, pick_quality(w, h, cfg, is_cover), 1.0, 0.0)
     } else if graphic {
         // Текст: почти без уменьшения, и только пока штрих остаётся различимым.
         // `text_min_stroke` задан в пикселях, а `stroke` измерен на исходнике,
@@ -1597,15 +1607,11 @@ fn encode_image(
         };
         (cfg.text_shrink_percent, cfg.text_quality, 0.85, ms)
     } else {
-        // Пол — это и есть предел уменьшения: `shrink_percent = 34` означает
-        // масштаб 0.66. Прежний жёсткий пол 0.65 молча съедал всю надбавку:
+        // Пол — это и есть предел уменьшения: `shrink_percent = 35` означает
+        // масштаб 0.65. Прежний жёсткий пол 0.65 молча съедал всю надбавку:
         // любой `shrink` больше 35 % упирался в него и не давал ничего.
-        // Мелкие картинки ужимаются не сильнее чем до 80 % исходного.
-        const SMALL_FLOOR: f64 = 0.80;
-        let small = w < cfg.small_px || h < cfg.small_px;
         let target = 1.0 - cfg.shrink_percent / 100.0;
-        let floor = if small { target.max(SMALL_FLOOR) } else { target.max(0.5) };
-        (cfg.shrink_percent, pick_quality(w, h, cfg, is_cover), floor, 0.0)
+        (cfg.shrink_percent, pick_quality(w, h, cfg, is_cover), target.max(0.5), 0.0)
     };
 
     // Самый сильный допустимый масштаб: вписаться в лимит, уменьшить на
@@ -1652,7 +1658,6 @@ fn encode_image(
     // Мелким картинкам разрешена более высокая скорость rav1e: сжимать в них
     // почти нечего, а одно кодирование стоит ровно столько же, сколько у
     // крупной. Крупные остаются на своей скорости — там разница видна.
-    let small = is_small_image(data.len(), w, h, cfg);
     let speed = pick_avif_speed(w, h, graphic, is_cover, cfg).max(if small {
         cfg.small_avif_speed
     } else {
