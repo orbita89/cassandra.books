@@ -686,8 +686,33 @@ fn is_raster_entry(name: &str, data: &[u8]) -> bool {
 /// Проверка по пикселям, а не по `ColorType`: у JPEG-исходника тип `Rgb8`
 /// даже тогда, когда картинка на самом деле чёрно-белая, и `has_color()`
 /// в одиночку такой случай не поймает.
+///
+/// В горячем пути её заменил `image_kind`: он отдаёт и серость, и
+/// прозрачность за один проход. Здесь она остаётся для тестов.
+#[cfg(test)]
 fn is_grayscale(img: &RgbaImage) -> bool {
     img.pixels().all(|p| p[0] == p[1] && p[1] == p[2])
+}
+
+/// Один проход по кадру: `(серый, непрозрачный)`.
+///
+/// `is_grayscale` + `is_opaque` сканировали пиксели дважды. Для лестницы AVIF
+/// это было до 8 проходов на кадр (2 проверки × до 4 кандидатов).
+fn image_kind(img: &RgbaImage) -> (bool, bool) {
+    let mut gray = true;
+    let mut opaque = true;
+    for p in img.pixels() {
+        if p[0] != p[1] || p[1] != p[2] {
+            gray = false;
+        }
+        if p[3] != 255 {
+            opaque = false;
+        }
+        if !gray && !opaque {
+            return (false, false);
+        }
+    }
+    (gray, opaque)
 }
 
 /// Полностью ли непрозрачная картинка (альфа 255 везде).
@@ -1387,9 +1412,11 @@ fn avif_candidate(
     h: u32,
     quality: f32,
     speed: u8,
+    gray: bool,
+    opaque: bool,
 ) -> Result<Candidate> {
-    let (color, buf) = if is_opaque(img) {
-        if is_grayscale(img) {
+    let (color, buf) = if opaque {
+        if gray {
             (ExtendedColorType::L8, gray_to_luma(img))
         } else {
             (ExtendedColorType::Rgb8, rgba_to_rgb(img))
@@ -1525,6 +1552,10 @@ fn encode_image(
 
     let speed = pick_avif_speed(w, h, graphic, is_cover, cfg);
 
+    // Серость и прозрачность не меняются при ресайзе. Считаем один раз
+    // на исходном кадре, а не на каждом кандидате лестницы.
+    let (gray_src, opaque_src) = image_kind(&rgba);
+
     // --- основной путь: AVIF -------------------------------------------------
     //
     // Обложка больше не форсируется в AVIF: на скорости 2 она стоила 4 с, на
@@ -1547,7 +1578,8 @@ fn encode_image(
                 resized
             };
             tally_ns(&RESIZE_NS, t_resize);
-            let cand = match avif_candidate(&prepped, nw, nh, quality, speed) {
+            let cand = match avif_candidate(&prepped, nw, nh, quality, speed, gray_src, opaque_src)
+            {
                 Ok(c) => c,
                 Err(err) => {
                     eprintln!("    [!] AVIF не удался для `{name}`: {err} — беру WebP");
