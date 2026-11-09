@@ -59,14 +59,23 @@ fn tally(slot: &AtomicU64, t: Instant) {
 }
 
 /// Напечатать пофазный отчёт, если попросили.
-fn print_profile(cores: usize) {
+fn print_profile(cores: usize, cfg: &ImageOptConfig) {
     if std::env::var_os("LIBRARY_PROFILE").is_none() {
         return;
     }
+    let text = profile_text(cores, cfg);
+    if !text.is_empty() {
+        eprintln!("\n{text}");
+    }
+}
+
+/// Пофазный отчёт: один и тот же текст идёт в консоль (при `LIBRARY_PROFILE=1`)
+/// и в `data/import.log`.
+fn profile_text(cores: usize, cfg: &ImageOptConfig) -> String {
     let g = |a: &AtomicU64| a.load(Ordering::Relaxed) as f64 / 1e9;
     let wall = g(&PROFILE.wall);
     if wall <= 0.0 {
-        return;
+        return String::new();
     }
     let parts = [
         ("распаковка ZIP", g(&PROFILE.unzip)),
@@ -77,20 +86,31 @@ fn print_profile(cores: usize) {
         ("индекс+метаданные", g(&PROFILE.index)),
     ];
     let sum: f64 = parts.iter().map(|(_, v)| *v).sum();
-    eprintln!("\n[профиль] календарное время {wall:.1} с, потоков {cores}");
-    for (name, v) in parts {
-        eprintln!("  {name:<24} {v:>9.1} с процессорного  {:>5.1} %", v / sum * 100.0);
-    }
-    eprintln!("  {:<24} {sum:>9.1} с", "ИТОГО по фазам");
-    eprintln!(
-        "  средняя загрузка: {:.1} ядер из {cores} (простой — ожидание упаковки и хвост)",
-        sum / wall
+    let mut s = String::new();
+    s.push_str(
+        "Время по фазам (сумма по потокам, не календарное)\n\
+         ---------------------------------------------------------------\n",
     );
+    s.push_str(&format!(
+        "  {:<24} {:>9.1} с\n",
+        "календарное время", wall
+    ));
+    for (name, v) in parts {
+        s.push_str(&format!(
+            "  {name:<24} {v:>9.1} с процессорного  {:>5.1} %\n",
+            v / sum * 100.0
+        ));
+    }
+    s.push_str(&format!("  {:<24} {sum:>9.1} с\n", "ИТОГО по фазам"));
+    s.push_str(&format!(
+        "  средняя загрузка: {:.1} ядер из {cores} (простой — ожидание упаковки и хвост)\n",
+        sum / wall
+    ));
 
     // Разбивка самой тяжёлой фазы: чем именно занято кодирование картинок.
     use images as im;
     let calls = |a: &std::sync::atomic::AtomicUsize| a.load(Ordering::Relaxed);
-    eprintln!("  внутри «картинок»:");
+    s.push_str("\n  внутри «картинок»:\n");
     let mut inner = [
         ("декодирование исходника", g(&im::DECODE_NS)),
         ("анализ графика/фото", g(&im::FEATURES_NS)),
@@ -101,13 +121,125 @@ fn print_profile(cores: usize) {
     ];
     inner.sort_by(|a, b| b.1.total_cmp(&a.1));
     for (name, v) in inner {
-        eprintln!("    {name:<24} {v:>9.1} с");
+        s.push_str(&format!("    {name:<24} {v:>9.1} с\n"));
     }
-    eprintln!(
-        "    вызовов энкодеров: AVIF {}, WebP {}",
+    s.push_str(&format!(
+        "    вызовов энкодеров: AVIF {}, WebP {}\n",
         calls(&im::AVIF_CALLS),
         calls(&im::WEBP_CALLS)
-    );
+    ));
+
+    // Мелкие картинки кодируются на своей скорости — их считаем отдельно,
+    // иначе непонятно, сколько времени уходит на те, где сжимать нечего.
+    let small = calls(&im::SMALL_IMAGES);
+    let large = calls(&im::LARGE_IMAGES);
+    let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
+    s.push_str(&format!(
+        "\nКартинки: {} всего, {} мелких, {} крупных\n",
+        small + large,
+        small,
+        large
+    ));
+    s.push_str(&format!(
+        "  мелкие  (вес < {} КБ или сторона < {}): {:>6} шт, {:>7.1} МБ исходников, \
+         AVIF {:>7.1} с (скорость {})\n",
+        cfg.small_bytes / 1024,
+        cfg.small_px,
+        small,
+        mb(im::SMALL_BYTES.load(Ordering::Relaxed)),
+        g(&im::SMALL_AVIF_NS),
+        cfg.small_avif_speed,
+    ));
+    s.push_str(&format!(
+        "  крупные (остальные):                    {:>6} шт, {:>7.1} МБ исходников, \
+         AVIF {:>7.1} с (обычная скорость)\n",
+        large,
+        mb(im::LARGE_BYTES.load(Ordering::Relaxed)),
+        g(&im::LARGE_AVIF_NS),
+    ));
+
+    // Шрифты: если их в корпусе нет, так и пишем — иначе строка «0 Б → 0 Б»
+    // выглядит как сломанный subsetting, хотя это его отсутствие.
+    let fonts = calls(&im::FONTS_FILES);
+    s.push_str("\nВстроенные шрифты (subsetting)\n");
+    if fonts == 0 {
+        s.push_str("  во всём корпусе не нашлось ни одного .ttf/.otf — ужимать нечего\n");
+    } else {
+        let before = im::FONTS_BEFORE.load(Ordering::Relaxed);
+        let after = im::FONTS_AFTER.load(Ordering::Relaxed);
+        let saved = if before > 0 {
+            (1.0 - after as f64 / before as f64) * 100.0
+        } else {
+            0.0
+        };
+        s.push_str(&format!(
+            "  файлов {fonts}, ужато {}, вес {:.2} МБ → {:.2} МБ (−{:.1} %)\n",
+            calls(&im::FONTS_SUBSET),
+            mb(before),
+            mb(after),
+            saved
+        ));
+    }
+    s
+}
+
+/// Записать отчёт об импорте в `data/import.log`.
+///
+/// Пишется всегда, а не по переменной окружения: это единственный след того,
+/// сколько импорт занял и на что ушло время. Файл маленький (пара килобайт),
+/// поэтому жалеть его незачем.
+#[allow(clippy::too_many_arguments)]
+fn write_import_log(
+    data_dir: &Path,
+    zip: &Path,
+    cfg: &ImageOptConfig,
+    cores: usize,
+    books: usize,
+    failed: usize,
+    skipped: usize,
+) {
+    let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
+    let mut s = String::new();
+    s.push_str("Импорт библиотеки — отчёт\n");
+    s.push_str("=============================================================\n");
+    s.push_str(&format!("архив:             {}\n", zip.display()));
+    s.push_str(&format!("каталог данных:    {}\n", data_dir.display()));
+    s.push_str(&format!("дата:              {}\n", crate::fb2epub::now_iso8601()));
+    s.push_str(&format!(
+        "книг обработано:   {books} (ошибок {failed}, нерусских отброшено {skipped})\n"
+    ));
+    s.push_str(&format!("потоков:           {cores}\n"));
+
+    // Что получилось на выходе.
+    let mut archives: Vec<String> = Vec::new();
+    let mut archive_bytes = 0u64;
+    if let Ok(rd) = fs::read_dir(data_dir.join("archives")) {
+        for entry in rd.flatten() {
+            if let Ok(meta) = entry.metadata() {
+                if meta.is_file() {
+                    archive_bytes += meta.len();
+                    archives.push(entry.file_name().to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+    archives.sort();
+    if !archives.is_empty() {
+        s.push_str(&format!(
+            "архивы:            {} — {:.1} МБ\n",
+            archives.join(", "),
+            mb(archive_bytes)
+        ));
+    }
+
+    s.push('\n');
+    s.push_str(&profile_text(cores, cfg));
+
+    let path = data_dir.join("import.log");
+    match fs::write(&path, s) {
+        Ok(()) => eprintln!("[лог] отчёт об импорте: {}", path.display()),
+        Err(err) => eprintln!("[!] не удалось записать {}: {err}", path.display()),
+    }
 }
 
 /// Сколько потоков задействовать: 0 в настройках = все доступные ядра.
@@ -556,7 +688,16 @@ fn run_import(
     PROFILE
         .wall
         .store(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    print_profile(threads);
+    print_profile(threads, &settings.image);
+    write_import_log(
+        data_dir,
+        zip,
+        &settings.image,
+        threads,
+        all_books.len(),
+        failed.load(Ordering::Relaxed),
+        skipped.load(Ordering::Relaxed),
+    );
     let _ = tx.send(WorkerMsg::Finished {
         books: all_books.len(),
         failed: failed.load(Ordering::Relaxed),

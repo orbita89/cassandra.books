@@ -1703,7 +1703,7 @@ fn bcp47(lang: &str) -> String {
 }
 
 /// `dcterms:modified` обязателен для EPUB 3 и должен быть в UTC.
-fn now_iso8601() -> String {
+pub(crate) fn now_iso8601() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())

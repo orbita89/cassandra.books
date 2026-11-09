@@ -61,12 +61,66 @@ pub static WEBP_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// Сколько раз вызывался WebP-энкодер.
 pub static WEBP_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+// --- мелкие картинки против крупных ----------------------------------------
+//
+// Мелким (`is_small_image`) разрешена своя скорость rav1e, поэтому их считают
+// и меряют отдельно: иначе непонятно, сколько времени уходит на те картинки,
+// которые ничего не весят, и сколько на остальные.
+
+/// Сколько мелких картинок закодировано.
+pub static SMALL_IMAGES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Сколько крупных картинок закодировано.
+pub static LARGE_IMAGES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Суммарный вес исходников мелких картинок, байт.
+pub static SMALL_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Суммарный вес исходников крупных картинок, байт.
+pub static LARGE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Наносекунды AVIF-кодирования мелких картинок.
+pub static SMALL_AVIF_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Наносекунды AVIF-кодирования крупных картинок.
+pub static LARGE_AVIF_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+// --- встроенные шрифты -----------------------------------------------------
+
+/// Сколько шрифтовых файлов встретилось во всех книгах.
+pub static FONTS_FILES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Сколько шрифтов удалось ужать.
+pub static FONTS_SUBSET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Суммарный вес шрифтов до subsetting, байт.
+pub static FONTS_BEFORE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Суммарный вес шрифтов после subsetting, байт.
+pub static FONTS_AFTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Мелкая ли картинка: исходник легче `small_bytes` или не дотягивает до
+/// `small_px` хотя бы по одной стороне.
+///
+/// Граница по сторонам — та же, что у `pick_quality` (там по ней выбирается
+/// `quality_small`), чтобы «мелкая» значило одно и то же во всём файле.
+fn is_small_image(bytes: usize, w: u32, h: u32, cfg: &ImageOptConfig) -> bool {
+    bytes < cfg.small_bytes || w < cfg.small_px || h < cfg.small_px
+}
+
 /// Прибавить к счётчику прошедшее с `t` время.
 fn tally_ns(slot: &std::sync::atomic::AtomicU64, t: std::time::Instant) {
     slot.fetch_add(
         t.elapsed().as_nanos() as u64,
         std::sync::atomic::Ordering::Relaxed,
     );
+}
+
+/// Отнести время жизни к счётчику мелких или крупных картинок.
+///
+/// Отдельный тип нужен, чтобы не расставлять замеры по всем `return` внутри
+/// кодирования: `Drop` сработает на любом выходе из области видимости.
+struct SpeedTimer {
+    slot: &'static std::sync::atomic::AtomicU64,
+    t: std::time::Instant,
+}
+
+impl Drop for SpeedTimer {
+    fn drop(&mut self) {
+        tally_ns(self.slot, self.t);
+    }
 }
 
 /// Растровые форматы, которые мы обязаны перевести в WebP или AVIF.
@@ -121,6 +175,17 @@ pub struct ImageOptConfig {
     pub small_px: u32,
     /// Качество для мелких картинок: их не так жалко, но артефакты видны сильнее.
     pub quality_small: f32,
+    /// Исходник легче этого — картинка тоже считается мелкой.
+    ///
+    /// Вместе с `small_px` даёт полное определение: мелкая — значит весит
+    /// меньше `small_bytes` **или** не дотягивает до `small_px` хотя бы по
+    /// одной стороне. Сжимать в такой картинке почти нечего, а кодирование
+    /// стоит ровно столько же, сколько у большой, поэтому им разрешена
+    /// отдельная (более высокая) скорость rav1e.
+    pub small_bytes: usize,
+    /// Скорость rav1e для мелких картинок. Выше общей: на кадре в пару сотен
+    /// пикселей разница между скоростями почти не видна, а время экономит.
+    pub small_avif_speed: u8,
     /// Кодировать ли AVIF (кодировщик `ravif`, чистый Rust, без внешних процессов).
     pub avif: bool,
     /// Скорость rav1e для фотографий, 1..10: 1 — медленно и мелко,
@@ -189,6 +254,8 @@ impl ImageOptConfig {
     /// * `LIBRARY_MAX_W`, `LIBRARY_MAX_H` — предел вписывания;
     /// * `LIBRARY_QUALITY`, `LIBRARY_TEXT_QUALITY`, `LIBRARY_COVER_QUALITY`;
     /// * `LIBRARY_AVIF_SPEED`, `LIBRARY_AVIF_SPEED_GRAPHIC` — скорость rav1e;
+    /// * `LIBRARY_SMALL_BYTES`, `LIBRARY_SMALL_AVIF_SPEED` — что считать мелкой
+    ///   картинкой и с какой скоростью её кодировать;
     /// * `LIBRARY_WEBP=1` — отказаться от AVIF в пользу WebP;
     /// * `LIBRARY_WEBP_METHOD` — метод libwebp (0..6).
     pub fn from_env() -> Self {
@@ -221,6 +288,12 @@ impl ImageOptConfig {
         }
         if let Some(v) = int("LIBRARY_AVIF_SPEED_COVER") {
             c.avif_speed_cover = v.min(10) as u8;
+        }
+        if let Some(v) = int("LIBRARY_SMALL_BYTES") {
+            c.small_bytes = v as usize;
+        }
+        if let Some(v) = int("LIBRARY_SMALL_AVIF_SPEED") {
+            c.small_avif_speed = v.min(10) as u8;
         }
         if std::env::var_os("LIBRARY_WEBP").is_some() {
             c.avif = false;
@@ -263,6 +336,13 @@ impl Default for ImageOptConfig {
             try_original_size: false,
             small_px: 300,
             quality_small: 48.0,
+            // 50 КБ: картинка такого веса в книге — почти всегда мелкая
+            // иллюстрация или буквица, и держать на ней скорость 2 незачем.
+            small_bytes: 50 * 1024,
+            // 6 — колено кривой: на 14 книгах это 1.79x быстрее при +8.4 %
+            // размера архива. Для мелких картинок берём только их, крупные
+            // остаются на скорости 2.
+            small_avif_speed: 6,
             avif: true,
             avif_speed: 2,
             avif_speed_graphic: 2,
@@ -1200,15 +1280,21 @@ fn subset_fonts_in(entries: &mut [(String, Vec<u8>)], stats: &mut ImageOptStats)
             continue;
         }
         stats.fonts_before += data.len() as u64;
+        let before = data.len() as u64;
         match subset_one_font(data, &chars) {
             Ok(sub) if sub.len() < data.len() => {
                 stats.fonts_subset += 1;
                 *data = sub;
+                FONTS_SUBSET.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             Ok(_) => {}
             Err(err) => eprintln!("    [!] шрифт `{name}` не удалось ужать: {err}"),
         }
         stats.fonts_after += data.len() as u64;
+        // Те же цифры — в общий счётчик процесса: их пишет лог импорта.
+        FONTS_FILES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        FONTS_BEFORE.fetch_add(before, std::sync::atomic::Ordering::Relaxed);
+        FONTS_AFTER.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
     }
     Ok(())
 }
@@ -1550,7 +1636,22 @@ fn encode_image(
     // (условие `ok || last` при `last == false`) и молча ушла в WebP.
     let single = ladder.len() == 1;
 
-    let speed = pick_avif_speed(w, h, graphic, is_cover, cfg);
+    // Мелким картинкам разрешена более высокая скорость rav1e: сжимать в них
+    // почти нечего, а одно кодирование стоит ровно столько же, сколько у
+    // крупной. Крупные остаются на своей скорости — там разница видна.
+    let small = is_small_image(data.len(), w, h, cfg);
+    let speed = pick_avif_speed(w, h, graphic, is_cover, cfg).max(if small {
+        cfg.small_avif_speed
+    } else {
+        0
+    });
+    if small {
+        SMALL_IMAGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        SMALL_BYTES.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        LARGE_IMAGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        LARGE_BYTES.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
 
     // Признаки исходного кадра — для кандидата без уменьшения (там кадр тот
     // же самый). На уменьшенном кадре их приходится считать заново: Lanczos3
@@ -1564,6 +1665,11 @@ fn encode_image(
     // скорости 8 — 1.7 с, и 85 обложек съедали 46 % всей работы над картинками.
     // Теперь обложка кодируется тем же форматом, что и всё остальное.
     if cfg.avif {
+        // Время именно этого кодирования — в счётчик своей группы картинок.
+        let _split = SpeedTimer {
+            slot: if small { &SMALL_AVIF_NS } else { &LARGE_AVIF_NS },
+            t: std::time::Instant::now(),
+        };
         let mut avif: Option<Candidate> = None;
         for &scale in &ladder {
             let (nw, nh) = dims_at_scale(w, h, scale);
@@ -2893,7 +2999,147 @@ mod tests {
         assert_eq!(pick_quality(100, 100, &cfg, true), 50.0);
     }
 
+    /// Шумный PNG заданного размера: он плохо жмётся, поэтому весит заметно
+    /// больше 50 КБ и годится для проверки порога по весу.
+    fn noise_png(w: u32, h: u32) -> Vec<u8> {
+        let img = image::RgbaImage::from_fn(w, h, |x, y| {
+            let v = x
+                .wrapping_mul(2_654_435_761)
+                .wrapping_add(y.wrapping_mul(40_503));
+            image::Rgba([(v >> 7) as u8, (v >> 11) as u8, (v >> 3) as u8, 255])
+        });
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut out, image::ImageFormat::Png)
+            .expect("PNG должен записаться");
+        out.into_inner()
+    }
+
+    #[test]
+    fn small_image_is_detected_by_weight_or_side() {
+        let cfg = ImageOptConfig::default();
+        // Мелкая по весу, хотя по сторонам полноценная.
+        assert!(is_small_image(40 * 1024, 900, 900, &cfg));
+        // Мелкая по стороне, хотя весит много.
+        assert!(is_small_image(400 * 1024, 299, 900, &cfg));
+        assert!(is_small_image(400 * 1024, 900, 299, &cfg));
+        // Границы — строго «меньше», ровно как у `pick_quality`.
+        assert!(!is_small_image(50 * 1024, 300, 300, &cfg));
+        // Крупная по обоим признакам.
+        assert!(!is_small_image(400 * 1024, 900, 900, &cfg));
+    }
+
+    #[test]
+    fn small_images_are_encoded_at_the_small_speed() {
+        // Мелкая картинка: скорость из `small_avif_speed` доходит до энкодера,
+        // поэтому байты на скоростях 2 и 6 обязаны различаться.
+        let png = noise_png(150, 150);
+        let slow = ImageOptConfig {
+            small_avif_speed: 2,
+            ..Default::default()
+        };
+        let fast = ImageOptConfig {
+            small_avif_speed: 6,
+            ..Default::default()
+        };
+        let a = encode_image("a.png", &png, &slow, false)
+            .expect("кодирование не должно падать")
+            .expect("картинка должна закодироваться");
+        let b = encode_image("a.png", &png, &fast, false)
+            .expect("кодирование не должно падать")
+            .expect("картинка должна закодироваться");
+        assert_eq!(a.format, Format::Avif);
+        assert_ne!(
+            a.data, b.data,
+            "мелкая картинка должна кодироваться на своей скорости"
+        );
+
+        // Крупная картинка: правило её не касается, байты совпадают.
+        let big = noise_png(320, 320);
+        assert!(big.len() > 50 * 1024, "исходник {} Б", big.len());
+        let a = encode_image("big.png", &big, &slow, false)
+            .expect("кодирование не должно падать")
+            .expect("картинка должна закодироваться");
+        let b = encode_image("big.png", &big, &fast, false)
+            .expect("кодирование не должно падать")
+            .expect("картинка должна закодироваться");
+        assert_eq!(
+            a.data, b.data,
+            "крупная картинка не должна зависеть от скорости для мелких"
+        );
+    }
+
     // --- шаги 1-3: минификация, шрифты, контейнер ---------------------------
+
+    /// Настоящий .ttf с кириллицей из системы.
+    ///
+    /// В корпусе FB2 встроенных шрифтов нет вовсе (только JPEG/PNG), поэтому
+    /// единственный способ проверить субсеттинг — взять системный шрифт.
+    fn system_font() -> Option<(String, Vec<u8>)> {
+        const CANDIDATES: [&str; 4] = [
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+            "/usr/share/fonts/TTF/OpenSans-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/liberation/LiberationSerif-Regular.ttf",
+        ];
+        CANDIDATES
+            .iter()
+            .find_map(|p| std::fs::read(p).ok().map(|b| ((*p).to_string(), b)))
+    }
+
+    #[test]
+    fn font_subsetting_shrinks_a_real_font() {
+        let Some((path, ttf)) = system_font() else {
+            eprintln!("системного .ttf с кириллицей не нашлось — тест пропущен");
+            return;
+        };
+        let text = "Жили-были старик со старухой у самого синего моря.";
+        let mut entries = vec![
+            ("OEBPS/fonts/book.ttf".to_string(), ttf.clone()),
+            (
+                "OEBPS/ch1.xhtml".to_string(),
+                format!("<html><body><p>{text}</p></body></html>").into_bytes(),
+            ),
+        ];
+        let mut stats = ImageOptStats::default();
+        subset_fonts_in(&mut entries, &mut stats).expect("субсеттинг не должен падать");
+
+        let after = &entries[0].1;
+        assert_eq!(stats.fonts_subset, 1, "шрифт {path} не ужался");
+        assert!(
+            after.len() < ttf.len(),
+            "{path}: {} Б → {} Б",
+            ttf.len(),
+            after.len()
+        );
+        assert_eq!(stats.fonts_before, ttf.len() as u64);
+        assert_eq!(stats.fonts_after, after.len() as u64);
+        println!(
+            "субсеттинг {path}: {} → {} Б (−{:.0} %)",
+            ttf.len(),
+            after.len(),
+            (1.0 - after.len() as f64 / ttf.len() as f64) * 100.0
+        );
+
+        // Размер определяется именно набором символов книги: один символ даёт
+        // заметно меньше, чем весь алфавит. Иначе «ужатие» было бы фиктивным.
+        let one = subset_one_font(&ttf, "Ж").expect("hb-subset");
+        let alphabet: String = "абвгдеёжзийклмнопрстуфхцчшщъыьэюя\
+                                АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ"
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let many = subset_one_font(&ttf, &alphabet).expect("hb-subset");
+        assert!(
+            one.len() < many.len(),
+            "1 символ {} Б, {} символов {} Б",
+            one.len(),
+            alphabet.chars().count(),
+            many.len()
+        );
+        // И оба варианта меньше исходника.
+        assert!(many.len() < ttf.len());
+    }
 
     /// Собрать минимальный EPUB в памяти: `mimetype` + OPF + XHTML + NCX.
     fn sample_epub(path: &Path) {
