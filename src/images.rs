@@ -2,9 +2,9 @@
 //!
 //! Что делает:
 //!   * достаёт из EPUB **все** растровые картинки (jpeg/png/gif/bmp/tiff/webp/avif);
-//!   * уменьшает каждую — сначала до вписывания в `max_w`x`max_h`, а затем ещё
-//!     на `shrink_percent` процентов (по умолчанию 34 %) — то есть даже картинки,
-//!     которые и так меньше лимита, всё равно уменьшаются;
+//!   * по умолчанию **не уменьшает** картинки: разрешение остаётся как в
+//!     исходнике (`max_w`/`max_h` = 0, `shrink_percent` = 0), меняется только
+//!     формат и качество; лимиты включаются, если их задать явно;
 //!   * перебирает несколько вариантов и берёт самый маленький по байтам:
 //!     WebP lossy (quality 35, а для мелких картинок — 48), WebP near-lossless
 //!     (для png/gif/bmp/tiff, `near_lossless=60`) и AVIF lossy (через `ravif`,
@@ -327,12 +327,13 @@ impl Default for ImageOptConfig {
             //   AVIF q35,   480x720  → 246 с, архив 34.58 МБ  (−9.2 %)
             // Скорость rav1e почти ничего не даёт: speed 1 против speed 2 —
             // это −0.4 % размера за 3.8x времени, поэтому стоит speed 2.
-            max_w: 480,
-            max_h: 720,
-            // Масштаб 0.66 — это прежние 0.55 + 20 %. Растёт именно размер
-            // картинки, а не качество (quality не трогали): мелкий текст и
-            // штрихи читаются лучше как раз за счёт лишних пикселей.
-            shrink_percent: 34.0,
+            // Разрешение не трогаем вовсе: картинка остаётся как в исходнике,
+            // меняется только формат (AVIF) и качество. 0 = без ограничения.
+            max_w: 0,
+            max_h: 0,
+            // 0 — не уменьшать сверх лимита: вместе с `max_w/max_h = 0` это
+            // означает «разрешение как в исходнике».
+            shrink_percent: 0.0,
             quality: 35.0,
             method: 4,
             min_side: 240,
@@ -363,7 +364,7 @@ impl Default for ImageOptConfig {
             lossless_quality: 75.0,
             text_detect: true,
             text_min_stroke: 2.0,
-            text_shrink_percent: 10.0,
+            text_shrink_percent: 0.0,
             text_quality: 50.0,
             cover_quality: 55.0,
             minify: true,
@@ -1570,9 +1571,15 @@ fn encode_image(
     let graphic = !is_cover && cfg.text_detect && is_graphic_features(per_1k, paper, sat);
     tally_ns(&FEATURES_NS, t_features);
 
-    let fit = (cfg.max_w as f64 / w as f64)
-        .min(cfg.max_h as f64 / h as f64)
-        .min(1.0);
+    // 0 в любом из лимитов — «не ограничивать»: картинка остаётся в
+    // исходном разрешении, уменьшения нет вовсе.
+    let fit = if cfg.max_w == 0 || cfg.max_h == 0 {
+        1.0
+    } else {
+        (cfg.max_w as f64 / w as f64)
+            .min(cfg.max_h as f64 / h as f64)
+            .min(1.0)
+    };
 
     // Сколько уменьшать, с каким качеством и ниже какого масштаба нельзя.
     let (shrink, quality, floor, min_scale) = if is_cover {
@@ -1592,9 +1599,9 @@ fn encode_image(
         // Пол — это и есть предел уменьшения: `shrink_percent = 34` означает
         // масштаб 0.66. Прежний жёсткий пол 0.65 молча съедал всю надбавку:
         // любой `shrink` больше 35 % упирался в него и не давал ничего.
-        // Мелким картинкам уменьшение вредит сильнее, поэтому им пол мягче:
-        // 0.96 — это прежние 0.80 + 20 %, то есть они почти не уменьшаются.
-        const SMALL_FLOOR: f64 = 0.96;
+        // Мелкие картинки не уменьшаем совсем: при `shrink_percent = 0`
+        // это и так 1.0, но пол остаётся страховкой на случай ненулевого.
+        const SMALL_FLOOR: f64 = 1.0;
         let small = w < cfg.small_px || h < cfg.small_px;
         let target = 1.0 - cfg.shrink_percent / 100.0;
         let floor = if small { target.max(SMALL_FLOOR) } else { target.max(0.5) };
