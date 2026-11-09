@@ -37,7 +37,6 @@ pub struct Profile {
     pub convert: AtomicU64,
     pub images: AtomicU64,
     pub cover: AtomicU64,
-    pub chapters: AtomicU64,
     pub pack: AtomicU64,
     pub index: AtomicU64,
     pub wall: AtomicU64,
@@ -49,7 +48,6 @@ pub static PROFILE: Profile = Profile {
     convert: AtomicU64::new(0),
     images: AtomicU64::new(0),
     cover: AtomicU64::new(0),
-    chapters: AtomicU64::new(0),
     pack: AtomicU64::new(0),
     index: AtomicU64::new(0),
     wall: AtomicU64::new(0),
@@ -74,8 +72,7 @@ fn print_profile(cores: usize) {
         ("распаковка ZIP", g(&PROFILE.unzip)),
         ("конвертация FB2→EPUB", g(&PROFILE.convert)),
         ("картинки", g(&PROFILE.images)),
-        ("обложки", g(&PROFILE.cover)),
-        ("оглавление", g(&PROFILE.chapters)),
+        ("обложка+оглавление+проверка", g(&PROFILE.cover)),
         ("упаковка arx", g(&PROFILE.pack)),
         ("индекс+метаданные", g(&PROFILE.index)),
     ];
@@ -640,37 +637,46 @@ fn process_one(
         .with_context(|| format!("оптимизация картинок не удалась для {name}"))?;
     tally(&PROFILE.images, t_phase);
 
-    let (images_total, images_webp, images_avif) = images::count_images(&optimized)?;
-    if images_total != images_webp + images_avif {
+    // Один проход по готовому EPUB вместо четырёх: `count_images`,
+    // `find_dangling_refs`, `save_cover` и `read_chapters` открывали один и
+    // тот же ZIP по разу и декомпрессировали одни и те же записи.
+    let t_phase = Instant::now();
+    let summary = images::summarize_epub(&optimized)
+        .with_context(|| format!("не удалось прочитать {name} после оптимизации"))?;
+    tally(&PROFILE.cover, t_phase);
+
+    if summary.images_total != summary.images_webp + summary.images_avif {
         bail!(
-            "{name}: из {images_total} картинок только {} в WebP/AVIF — \
+            "{name}: из {} картинок только {} в WebP/AVIF — \
              требование «100 % WebP/AVIF» нарушено",
-            images_webp + images_avif
+            summary.images_total,
+            summary.images_webp + summary.images_avif
         );
     }
 
     // Ссылки на картинки, которых в EPUB нет. Это дефект исходного FB2
     // (битый base64), а не сбой конвертации — поэтому не ошибка, но и не молчание.
-    for (from, target) in images::find_dangling_refs(&optimized).unwrap_or_default() {
+    for (from, target) in &summary.dangling {
         warnings.push(format!("{name}: {from} ссылается на отсутствующий {target}"));
     }
 
     let _ = fs::remove_file(&converted);
 
     // ---- обложка -----------------------------------------------------------
-    // Берём готовый AVIF из оптимизированного EPUB: он закодирован тем же
+    // Берём готовый кадр из оптимизированного EPUB: он закодирован тем же
     // энкодером и с тем же качеством, что нужны обложке, а повторное кодирование
     // из исходника стоило около 12 % всей процессорной работы импорта.
     let t_phase = Instant::now();
-    let cover = save_cover(&optimized, id, covers_dir).ok().flatten();
+    let cover = match &summary.cover {
+        Some((source_name, bytes)) => Some(write_cover(covers_dir, id, source_name, bytes)?),
+        None => None,
+    };
     tally(&PROFILE.cover, t_phase);
 
     // ---- оглавление --------------------------------------------------------
     // Берём из готового EPUB: навигационный документ (nav.xhtml) построен по
     // секциям FB2, поэтому совпадает с тем, что покажет читалка.
-    let t_phase = Instant::now();
-    let chapters = read_chapters(&optimized).unwrap_or_default();
-    tally(&PROFILE.chapters, t_phase);
+    let chapters = summary_chapters(&summary);
 
     // Подробный отчёт по картинкам: включается переменной окружения, чтобы не
     // шуметь в обычном импорте, но был доступен для сравнения вариантов сжатия.
@@ -1109,6 +1115,7 @@ fn unescape(s: &str) -> String {
 ///
 /// EPUB — это ZIP, поэтому оглавление читается из уже собранного файла:
 /// Calibre строит его по секциям FB2, и оно совпадает с тем, что увидит читалка.
+#[cfg(test)]
 fn read_chapters(epub: &Path) -> Result<Vec<String>> {
     let file = fs::File::open(epub)?;
     let mut archive = zip::ZipArchive::new(file)?;
@@ -1199,28 +1206,55 @@ fn chapters_from_nav(xml: &str) -> Vec<String> {
 /// обложку в EPUB как AVIF с `cover_quality`. Второй проход (декодировать
 /// исходник, уменьшить, сжать заново) давал тот же кадр за ~12 % всего
 /// процессорного времени импорта.
+#[cfg(test)]
 fn save_cover(epub: &Path, id: u64, covers_dir: &Path) -> Result<Option<String>> {
     let Some((source_name, bytes)) = images::cover_bytes(epub)? else {
         return Ok(None);
     };
-    // Расширение берём у настоящей записи EPUB, а не пишем `.avif` всегда:
-    // обложка теперь кодируется тем же форматом, что и остальные картинки, и
-    // файл `821884.avif` с содержимым WebP ломал бы определение формата.
+    Ok(Some(write_cover(covers_dir, id, &source_name, &bytes)?))
+}
+
+/// Записать байты обложки в `covers/<id%1000>/<id>.<ext>` и вернуть путь.
+///
+/// Расширение берём у настоящей записи EPUB, а не пишем `.avif` всегда:
+/// обложка теперь кодируется тем же форматом, что и остальные картинки, и
+/// файл `821884.avif` с содержимым WebP ломал бы определение формата.
+///
+/// Обложки лежат в подкаталогах: на миллион книг плоский каталог — это
+/// миллион файлов в одном `readdir`, что плохо и для файловой системы, и
+/// для бэкапа. См. `db::Library::cover_rel_path`.
+fn write_cover(
+    covers_dir: &Path,
+    id: u64,
+    source_name: &str,
+    bytes: &[u8],
+) -> Result<String> {
     let ext = source_name
         .rsplit('.')
         .next()
         .filter(|e| !e.is_empty() && *e != source_name)
         .unwrap_or("img");
-    // Обложки лежат в подкаталогах: на миллион книг плоский каталог — это
-    // миллион файлов в одном `readdir`, что плохо и для файловой системы, и
-    // для бэкапа. См. `db::Library::cover_rel_path`.
     let file_name = crate::db::Library::cover_rel_path(id, ext);
     if let Some(parent) = covers_dir.join(&file_name).parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(covers_dir.join(&file_name), &bytes)
+    fs::write(covers_dir.join(&file_name), bytes)
         .with_context(|| format!("не удалось записать обложку {file_name}"))?;
-    Ok(Some(file_name))
+    Ok(file_name)
+}
+
+/// Главы из сводки: `toc.ncx`, а если он пуст — `nav.xhtml`.
+///
+/// Один в один `read_chapters`, но без повторного открытия ZIP.
+fn summary_chapters(summary: &images::EpubSummary) -> Vec<String> {
+    match summary.toc_ncx.as_deref().map(chapters_from_ncx) {
+        Some(c) if !c.is_empty() => c,
+        _ => summary
+            .toc_nav
+            .as_deref()
+            .map(chapters_from_nav)
+            .unwrap_or_default(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1299,5 +1333,91 @@ mod lang_tests {
         };
         let lv = "Sidraba vītols ir latviešu grāmata. ".repeat(20);
         assert_eq!(off.judge(&script_stats(lv.as_bytes())), None);
+    }
+}
+
+
+#[cfg(test)]
+mod summary_tests {
+    use super::*;
+    use crate::images::{self, pack_epub};
+    use image::{ExtendedColorType, ImageEncoder, RgbaImage};
+
+    /// Крошечный настоящий PNG: и сводка, и `count_images` смотрят на
+    /// сигнатуру, а не только на расширение.
+    fn tiny_png() -> Vec<u8> {
+        let img = RgbaImage::from_pixel(2, 2, image::Rgba([10, 20, 30, 255]));
+        let mut buf = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut buf)
+            .write_image(img.as_raw(), 2, 2, ExtendedColorType::Rgba8)
+            .unwrap();
+        buf
+    }
+
+    /// EPUB с обложкой, картинкой, оглавлением и одной битой ссылкой.
+    fn sample_epub(dir: &Path) -> PathBuf {
+        let png = tiny_png();
+        let entries = vec![
+            ("mimetype".to_string(), b"application/epub+zip".to_vec()),
+            (
+                "META-INF/container.xml".to_string(),
+                r#"<?xml version="1.0"?><container><rootfiles><rootfile full-path="OEBPS/content.opf"/></rootfiles></container>"#.as_bytes().to_vec(),
+            ),
+            (
+                "OEBPS/content.opf".to_string(),
+                r#"<package><manifest><item id="cov" href="cover.png" properties="cover-image"/><item id="img" href="img.png"/></manifest></package>"#.as_bytes().to_vec(),
+            ),
+            (
+                "OEBPS/toc.ncx".to_string(),
+                r#"<ncx><navMap><navPoint><navLabel><text>Глава первая</text></navLabel></navPoint></navMap></ncx>"#.as_bytes().to_vec(),
+            ),
+            (
+                "OEBPS/ch1.xhtml".to_string(),
+                b"<html><body><img src=\"img.png\"/><img src=\"gone.png\"/></body></html>".to_vec(),
+            ),
+            ("OEBPS/cover.png".to_string(), png.clone()),
+            ("OEBPS/img.png".to_string(), png),
+        ];
+        let out = dir.join("sample.epub");
+        pack_epub(&entries, &out, false, 9).unwrap();
+        out
+    }
+
+    /// Один проход обязан давать ровно то же, что четыре отдельных.
+    #[test]
+    fn summary_agrees_with_the_individual_passes() {
+        let dir = std::env::temp_dir().join(format!("lib_gui_sum_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let epub = sample_epub(&dir);
+
+        let s = images::summarize_epub(&epub).unwrap();
+
+        assert_eq!(s.images_total, 2, "обложка и картинка — обе растровые");
+        assert_eq!(
+            (s.images_total, s.images_webp, s.images_avif),
+            images::count_images(&epub).unwrap()
+        );
+        assert_eq!(
+            s.dangling,
+            vec![("OEBPS/ch1.xhtml".to_string(), "gone.png".to_string())]
+        );
+        assert_eq!(
+            s.dangling.len(),
+            images::find_dangling_refs(&epub).unwrap().len()
+        );
+
+        let (base, bytes) = images::cover_bytes(&epub).unwrap().unwrap();
+        let (s_base, s_bytes) = s.cover.clone().unwrap();
+        assert_eq!((s_base, s_bytes), (base, bytes.clone()));
+
+        assert_eq!(summary_chapters(&s), read_chapters(&epub).unwrap());
+        assert_eq!(summary_chapters(&s), vec!["Глава первая".to_string()]);
+
+        // Путь и байты обложки — те же, что пишет `process_one`.
+        let covers = dir.join("covers");
+        let written = save_cover(&epub, 7, &covers).unwrap().unwrap();
+        assert_eq!(written, crate::db::Library::cover_rel_path(7, "png"));
+        assert_eq!(fs::read(covers.join(&written)).unwrap(), bytes);
     }
 }

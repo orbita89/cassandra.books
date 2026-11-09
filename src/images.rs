@@ -2295,6 +2295,7 @@ fn find_cover_image(entries: &[(String, Vec<u8>)]) -> Option<String> {
 /// `images/cover.avif`, а `extract_cover` заново декодировал исходник,
 /// уменьшал его и снова гонял AVIF-энкодер — это около 12 % всей
 /// процессорной работы импорта на ровном месте. Здесь берём готовое.
+#[cfg(test)]
 pub fn cover_bytes(epub: &Path) -> Result<Option<(String, Vec<u8>)>> {
     let entries = read_entries(epub)?;
     let Some(wanted) = find_cover_image(&entries) else {
@@ -2441,6 +2442,7 @@ fn normalize_join(base_dir: &str, target: &str) -> String {
 ///
 /// Возвращает список `(файл, из которого ссылка, отсутствующий ресурс)`.
 /// Это позволяет отличить дефекты исходной книги от ошибок собственной правки ссылок.
+#[cfg(test)]
 pub fn find_dangling_refs(path: &Path) -> Result<Vec<(String, String)>> {
     let file =
         File::open(path).with_context(|| format!("не удалось открыть {}", path.display()))?;
@@ -2494,10 +2496,15 @@ pub fn find_dangling_refs(path: &Path) -> Result<Vec<(String, String)>> {
 }
 
 // ---------------------------------------------------------------------------
-// Проверка «100 % WebP»
+// Проверка «100 % WebP» (эталон для тестов)
 // ---------------------------------------------------------------------------
+//
+// В импорте эти три функции больше не вызываются: их заменил один проход
+// `summarize_epub`. Оставлены как независимый эталон — тест
+// `summary_agrees_with_the_individual_passes` сверяет с ними сводку.
 
 /// Сколько растровых картинок в EPUB и сколько из них WebP.
+#[cfg(test)]
 pub fn count_images(path: &Path) -> Result<(usize, usize, usize)> {
     let file = File::open(path)?;
     let mut archive = ZipArchive::new(file)?;
@@ -2543,6 +2550,197 @@ pub fn count_images(path: &Path) -> Result<(usize, usize, usize)> {
         }
     }
     Ok((total, webp, avif))
+}
+
+// ---------------------------------------------------------------------------
+// Один проход по готовому EPUB
+// ---------------------------------------------------------------------------
+
+/// Всё, что нужно знать о готовом EPUB после оптимизации.
+///
+/// Раньше worker открывал один и тот же ZIP четыре раза (`count_images`,
+/// `find_dangling_refs`, `save_cover`, `read_chapters`), и каждое открытие
+/// декомпрессировало одни и те же записи. Здесь проход один.
+pub struct EpubSummary {
+    pub images_total: usize,
+    pub images_webp: usize,
+    pub images_avif: usize,
+    pub dangling: Vec<(String, String)>,
+    /// `(basename, байты)` обложки, если она нашлась по OPF.
+    pub cover: Option<(String, Vec<u8>)>,
+    /// Текст `toc.ncx`. Разбирает его worker: формат оглавления — не дело
+    /// `images`, а проход по ZIP всё равно один.
+    pub toc_ncx: Option<String>,
+    /// Текст `nav.xhtml`/`toc.xhtml` — запасной вариант, если `toc.ncx` пуст.
+    pub toc_nav: Option<String>,
+}
+
+/// Собрать всё о готовом EPUB за один проход по ZIP.
+///
+/// Текстовые записи читаются целиком (в них ссылки, OPF и оглавление),
+/// остальные — только «голова» в 16 байт: по ней видно, картинка это или нет,
+/// а тянуть кадр целиком ради сигнатуры незачем.
+pub fn summarize_epub(path: &Path) -> Result<EpubSummary> {
+    let file = File::open(path)
+        .with_context(|| format!("не удалось открыть {}", path.display()))?;
+    let mut archive = ZipArchive::new(file)?;
+
+    let mut names: HashSet<String> = HashSet::new();
+    // (имя, индекс в ZIP) в порядке следования: обложку ищем так же, как
+    // `read_entries`, — первую подходящую запись, а не любую из `HashMap`.
+    let mut order: Vec<(String, usize)> = Vec::new();
+    let mut texts: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut toc_ncx: Option<String> = None;
+    let mut toc_nav: Option<String> = None;
+    let mut total = 0usize;
+    let mut webp = 0usize;
+    let mut avif = 0usize;
+
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i)?;
+        if entry.is_dir() {
+            continue;
+        }
+        let name = entry.name().to_string();
+        let lower = name.to_ascii_lowercase();
+        names.insert(name.clone());
+        order.push((name.clone(), i));
+
+        // Текстовые записи нужны целиком: в них и ссылки, и OPF, и оглавление.
+        if TEXT_EXTS.iter().any(|e| lower.ends_with(&format!(".{e}"))) {
+            let mut buf = Vec::with_capacity(entry.size() as usize);
+            entry
+                .read_to_end(&mut buf)
+                .with_context(|| format!("не удалось прочитать `{name}`"))?;
+            if lower.ends_with(".ncx") {
+                if toc_ncx.is_none() {
+                    toc_ncx = String::from_utf8(buf.clone()).ok();
+                }
+            } else if (lower.ends_with("nav.xhtml") || lower.ends_with("toc.xhtml"))
+                && toc_nav.is_none()
+            {
+                toc_nav = String::from_utf8(buf.clone()).ok();
+            }
+            texts.push((name, buf));
+            continue;
+        }
+
+        if lower.ends_with(".webp") {
+            total += 1;
+            webp += 1;
+            continue;
+        }
+        if lower.ends_with(".avif") {
+            total += 1;
+            avif += 1;
+            continue;
+        }
+        if RASTER_EXTS.iter().any(|e| lower.ends_with(&format!(".{e}"))) {
+            total += 1;
+            continue;
+        }
+
+        // Файл без «картиночного» расширения может всё же быть картинкой:
+        // Calibre кладёт обложку записью `cover`. Читаем только начало —
+        // сигнатуре хватает 16 байт.
+        let mut head = [0u8; 16];
+        let mut filled = 0usize;
+        while filled < head.len() {
+            match entry.read(&mut head[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) => return Err(e).context("не удалось прочитать начало записи EPUB"),
+            }
+        }
+        if filled > 0 && looks_like_raster(&head[..filled]) {
+            total += 1;
+        }
+    }
+
+    let mut dangling = Vec::new();
+    for (name, bytes) in &texts {
+        let text = String::from_utf8_lossy(bytes);
+        let base_dir = match name.rfind('/') {
+            Some(i) => &name[..i],
+            None => "",
+        };
+        for target in collect_refs(&text) {
+            let t = target.split(['#', '?']).next().unwrap_or("");
+            if t.is_empty()
+                || t.starts_with("http:")
+                || t.starts_with("https:")
+                || t.starts_with("data:")
+                || t.starts_with("mailto:")
+                || t.starts_with("//")
+                || t.starts_with('#')
+            {
+                continue;
+            }
+            let full = normalize_join(base_dir, t);
+            if names.contains(&full) || names.contains(t) {
+                continue;
+            }
+            dangling.push((name.clone(), target.clone()));
+        }
+    }
+
+    // Обложка: OPF (из `container.xml`, иначе первый `*.opf`) →
+    // `<item properties="cover-image">` → href → basename → байты записи.
+    let opf: Option<String> = texts
+        .iter()
+        .find(|(n, _)| n == "META-INF/container.xml")
+        .and_then(|(_, data)| {
+            let text = String::from_utf8_lossy(data);
+            let p = text.find("full-path=\"")? + "full-path=\"".len();
+            let e = text[p..].find('"')? + p;
+            let path = text[p..e].to_string();
+            names.contains(&path).then_some(path)
+        })
+        .or_else(|| {
+            texts
+                .iter()
+                .find(|(n, _)| n.to_lowercase().ends_with(".opf"))
+                .map(|(n, _)| n.clone())
+        });
+
+    let mut cover: Option<(String, Vec<u8>)> = None;
+    if let Some((_, opf_data)) = opf
+        .as_deref()
+        .and_then(|o| texts.iter().find(|(n, _)| n == o))
+    {
+        let text = String::from_utf8_lossy(opf_data);
+        let mut from = 0usize;
+        while let Some(p) = text[from..].find("<item") {
+            let start = from + p;
+            let Some(gt) = text[start..].find('>') else { break };
+            let item = &text[start..=start + gt];
+            if item.contains("cover-image") {
+                if let Some(href) = item_attr(item, "href") {
+                    let wanted = basename(&href).to_string();
+                    if let Some((_, idx)) = order.iter().find(|(n, _)| basename(n) == wanted) {
+                        let mut buf = Vec::new();
+                        archive
+                            .by_index(*idx)?
+                            .read_to_end(&mut buf)
+                            .with_context(|| format!("не удалось прочитать обложку `{wanted}`"))?;
+                        cover = Some((wanted, buf));
+                    }
+                }
+                break;
+            }
+            from = start + gt + 1;
+        }
+    }
+
+    Ok(EpubSummary {
+        images_total: total,
+        images_webp: webp,
+        images_avif: avif,
+        dangling,
+        cover,
+        toc_ncx,
+        toc_nav,
+    })
 }
 
 // ---------------------------------------------------------------------------
