@@ -150,12 +150,20 @@ fn profile_text(cores: usize, cfg: &ImageOptConfig) -> String {
         g(&im::SMALL_AVIF_NS),
         cfg.small_avif_speed,
     ));
-    let kept = calls(&im::KEPT_ORIGINAL);
-    if kept > 0 {
+    let trimmed = calls(&im::TRIMMED_IMAGES);
+    if trimmed > 0 {
         s.push_str(&format!(
-            "  оставлено исходными (наша версия крупнее): {:>4} шт, экономия {:>7.1} МБ\n",
-            kept,
-            mb(im::KEPT_BYTES.load(Ordering::Relaxed)),
+            "  обрезаны однотонные поля:               {:>6} шт, снято {:>7.1} Мпикс\n",
+            trimmed,
+            im::TRIMMED_PIXELS.load(Ordering::Relaxed) as f64 / 1e6,
+        ));
+    }
+    let adaptive = calls(&im::ADAPTIVE_IMAGES);
+    if adaptive > 0 {
+        s.push_str(&format!(
+            "  принято пониженное качество:            {:>6} шт, экономия {:>7.1} МБ\n",
+            adaptive,
+            mb(im::ADAPTIVE_SAVED.load(Ordering::Relaxed)),
         ));
     }
     let dedup = calls(&im::DEDUP_IMAGES);
@@ -870,7 +878,29 @@ fn run_import(
 }
 
 /// Обработать одну книгу: конвертация → 100 % WebP → проверка.
+/// Обработать одну книгу и **убрать за собой** при неудаче.
+///
+/// Папка с книгами целиком уходит в `.arx`, поэтому промежуточный
+/// `<id>.converted.epub` и недоделанный `<id>.epub` обязаны исчезнуть, если
+/// книга не прошла проверку: иначе в архиве окажется мусор в мегабайты.
 fn process_one(
+    fb2: &Path,
+    work_dir: &Path,
+    covers_dir: &Path,
+    batch: &str,
+    cfg: &ImageOptConfig,
+    lang: LangFilter,
+) -> Result<BookOutcome> {
+    let outcome = process_one_inner(fb2, work_dir, covers_dir, batch, cfg, lang);
+    if outcome.is_err() {
+        let stem = file_stem(fb2);
+        let _ = fs::remove_file(work_dir.join(format!("{stem}.converted.epub")));
+        let _ = fs::remove_file(work_dir.join(format!("{stem}.epub")));
+    }
+    outcome
+}
+
+fn process_one_inner(
     fb2: &Path,
     work_dir: &Path,
     covers_dir: &Path,

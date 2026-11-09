@@ -89,10 +89,86 @@ pub static DEDUP_IMAGES: std::sync::atomic::AtomicUsize = std::sync::atomic::Ato
 /// Сколько байт сэкономлено на этих копиях.
 pub static DEDUP_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Сколько картинок осталось в исходном виде: перекодировать их невыгодно.
-pub static KEPT_ORIGINAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-/// Сколько байт удалось на этом сэкономить.
-pub static KEPT_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// --- обрезка полей ---------------------------------------------------------
+
+/// Сколько картинок удалось обрезать по однотонным полям.
+pub static TRIMMED_IMAGES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Сколько пикселей на этом снято.
+pub static TRIMMED_PIXELS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+// --- адаптивное качество ---------------------------------------------------
+
+/// Сколько раз пониженное качество оказалось неотличимым и было принято.
+pub static ADAPTIVE_IMAGES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Сколько байт на этом сэкономлено.
+pub static ADAPTIVE_SAVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Попробовать закодировать кадр с меньшим качеством и принять его, если
+/// PSNR упал не больше чем на `adaptive_drop` дБ от уже полученного.
+///
+/// Возвращает принятый вариант. Ошибка кодирования, неудачное декодирование
+/// или потеря качества больше допустимой — всё это просто `None`.
+#[allow(clippy::too_many_arguments)]
+fn try_lower_quality(
+    frame: &RgbaImage,
+    w: u32,
+    h: u32,
+    quality: f32,
+    speed: u8,
+    gray: bool,
+    opaque: bool,
+    best: &Candidate,
+    cfg: &ImageOptConfig,
+) -> Option<Candidate> {
+    let low = avif_candidate(frame, w, h, quality, speed, gray, opaque).ok()?;
+    if low.data.len() >= best.data.len() {
+        return None;
+    }
+    // Декодируем оба варианта: сравнивать нужно с тем, что уже получилось,
+    // а не с исходником — иначе порог пришлось бы подбирать под корпус.
+    let decode = |data: &[u8]| {
+        image::load_from_memory(data)
+            .ok()
+            .map(|d| d.to_rgba8())
+            .filter(|d| d.dimensions() == (w, h))
+    };
+    let cur = psnr(frame, &decode(&best.data)?);
+    let low_psnr = psnr(frame, &decode(&low.data)?);
+    if low_psnr + cfg.adaptive_drop >= cur {
+        Some(low)
+    } else {
+        None
+    }
+}
+
+/// Пиковое отношение сигнал/шум между двумя кадрами одного размера, дБ.
+///
+/// Сравниваются только цветовые каналы: альфа у обоих кадров одна и та же
+/// (её наличие мы уже определили признаком `opaque`), и кодировщик в неё
+/// почти ничего не вкладывает.
+fn psnr(a: &RgbaImage, b: &RgbaImage) -> f64 {
+    if a.dimensions() != b.dimensions() {
+        return 0.0;
+    }
+    let mut sum = 0.0f64;
+    let mut n = 0u64;
+    for (pa, pb) in a.pixels().zip(b.pixels()) {
+        for c in 0..3 {
+            let d = f64::from(pa[c]) - f64::from(pb[c]);
+            sum += d * d;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        return 0.0;
+    }
+    let mse = sum / n as f64;
+    if mse <= f64::EPSILON {
+        return f64::INFINITY;
+    }
+    10.0 * (255.0f64 * 255.0 / mse).log10()
+}
+
 
 // --- встроенные шрифты -----------------------------------------------------
 
@@ -256,6 +332,21 @@ pub struct ImageOptConfig {
     /// Не сжимать записи EPUB: тогда батч целиком сожмёт `.arx` (zstd),
     /// и это на ~20 % меньше, чем Deflate внутри каждого EPUB по отдельности.
     pub epub_stored: bool,
+    /// Обрезать однотонные поля у сканов.
+    pub trim_margins: bool,
+    /// Подбирать качество под картинку: если пониженное качество не портит
+    /// кадр, берём его — файл выходит меньше при том же виде.
+    pub adaptive_quality: bool,
+    /// Насколько PSNR может упасть относительно текущего качества, дБ.
+    ///
+    /// Абсолютный порог тут не работает: наше качество 35 само даёт PSNR
+    /// около 30 дБ, поэтому любой «хороший» порог (40 дБ) не пропустил бы
+    /// ни одной картинки. Сравниваем с тем, что уже получилось.
+    pub adaptive_drop: f64,
+    /// На сколько единиц понижать качество за одну пробу.
+    pub adaptive_step: f32,
+    /// Ниже какого качества не опускаться.
+    pub adaptive_min_quality: f32,
 }
 
 impl ImageOptConfig {
@@ -309,6 +400,15 @@ impl ImageOptConfig {
         }
         if let Some(v) = int("LIBRARY_SMALL_AVIF_SPEED") {
             c.small_avif_speed = v.min(10) as u8;
+        }
+        if std::env::var("LIBRARY_TRIM_MARGINS").is_ok_and(|v| v == "0") {
+            c.trim_margins = false;
+        }
+        if std::env::var("LIBRARY_ADAPTIVE").is_ok_and(|v| v == "0") {
+            c.adaptive_quality = false;
+        }
+        if let Some(v) = num("LIBRARY_ADAPTIVE_DROP") {
+            c.adaptive_drop = v;
         }
         if std::env::var_os("LIBRARY_WEBP").is_some() {
             c.avif = false;
@@ -389,6 +489,19 @@ impl Default for ImageOptConfig {
             strip_calibre_meta: true,
             drop_ncx: true,
             subset_fonts: true,
+            // Поля скана не несут информации, а платим мы за каждый пиксель:
+            // у страниц с широкими полями обрезка снимает до трети площади.
+            trim_margins: true,
+            // ВЫКЛЮЧЕНО по замеру на корпусе из 14 книг: понижение качества на
+            // шаг (35 -> 27) стоит 1-2 дБ PSNR и даёт всего 1 % веса архива,
+            // а импорт удлиняет на 30 % (лишнее кодирование и два
+            // декодирования на картинку). Качество 35 и так на границе:
+            // абсолютный порог «не хуже 40 дБ» недостижим, там уже 30 дБ.
+            // Включается `LIBRARY_ADAPTIVE=1`, порог — `LIBRARY_ADAPTIVE_DROP`.
+            adaptive_quality: false,
+            adaptive_drop: 0.5,
+            adaptive_step: 8.0,
+            adaptive_min_quality: 24.0,
             zip_level: 9,
             epub_stored: true,
         }
@@ -432,10 +545,7 @@ pub struct ImageOptStats {
     pub images_dedup: usize,
     /// Сколько байт сэкономлено на этих копиях.
     pub bytes_dedup: u64,
-    /// Сколько картинок оставлено как есть: наша перекодировка вышла крупнее.
-    pub kept_original: usize,
-    /// Сколько байт на этом сэкономлено.
-    pub kept_bytes: u64,
+
     /// Максимальная ширина/высота до и после.
     pub max_before: (u32, u32),
     pub max_after: (u32, u32),
@@ -1415,6 +1525,95 @@ struct Encoded {
     before_h: u32,
 }
 
+/// Насколько цвет пикселя может отличаться от бумаги, чтобы считаться полем.
+const MARGIN_TOL: i32 = 20;
+
+/// Какая доля пикселей строки/столбца должна совпасть с бумагой.
+///
+/// Именно доля, а не «все»: у сканов бумага шумит, и требование «все до
+/// единого» не сработало бы никогда. 0,5 % исключений — это колонтитул или
+/// номер страницы, и такая строка полем уже не считается.
+const MARGIN_SHARE: f64 = 0.995;
+
+/// Сколько максимум можно срезать с одной стороны, доля от размера.
+///
+/// Страховка от ошибки детектора: даже если «полем» покажется что-то не то,
+/// потеряется не больше четверти картинки с каждой стороны.
+const MARGIN_MAX: f64 = 0.25;
+
+/// Найти однотонные поля скана.
+///
+/// Возвращает `(x, y, ширина, высота)` — то, что осталось после обрезки.
+/// Цвет бумаги берётся как медиана пикселей по периметру: у сканов это почти
+/// всегда светлый фон, но не обязательно чисто белый.
+fn trim_margins(img: &RgbaImage) -> (u32, u32, u32, u32) {
+    let (w, h) = img.dimensions();
+    if w < 32 || h < 32 {
+        return (0, 0, w, h);
+    }
+    let paper = border_color(img);
+    let is_paper = |p: &image::Rgba<u8>| {
+        (i32::from(p[0]) - i32::from(paper[0])).abs() <= MARGIN_TOL
+            && (i32::from(p[1]) - i32::from(paper[1])).abs() <= MARGIN_TOL
+            && (i32::from(p[2]) - i32::from(paper[2])).abs() <= MARGIN_TOL
+    };
+    let row_blank = |y: u32| {
+        let n = (0..w).filter(|&x| is_paper(img.get_pixel(x, y))).count();
+        n as f64 / f64::from(w) >= MARGIN_SHARE
+    };
+    let col_blank = |x: u32| {
+        let n = (0..h).filter(|&y| is_paper(img.get_pixel(x, y))).count();
+        n as f64 / f64::from(h) >= MARGIN_SHARE
+    };
+
+    let max_y = (f64::from(h) * MARGIN_MAX) as u32;
+    let max_x = (f64::from(w) * MARGIN_MAX) as u32;
+    let mut top = 0;
+    while top < max_y && row_blank(top) {
+        top += 1;
+    }
+    let mut bottom = 0;
+    while bottom < max_y && row_blank(h - 1 - bottom) {
+        bottom += 1;
+    }
+    let mut left = 0;
+    while left < max_x && col_blank(left) {
+        left += 1;
+    }
+    let mut right = 0;
+    while right < max_x && col_blank(w - 1 - right) {
+        right += 1;
+    }
+    (left, top, w - left - right, h - top - bottom)
+}
+
+/// Цвет бумаги — медиана пикселей по периметру картинки.
+fn border_color(img: &RgbaImage) -> [u8; 3] {
+    let (w, h) = img.dimensions();
+    let mut ch: [Vec<u8>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    let mut push = |p: &image::Rgba<u8>| {
+        for c in 0..3 {
+            ch[c].push(p[c]);
+        }
+    };
+    for x in 0..w {
+        push(img.get_pixel(x, 0));
+        push(img.get_pixel(x, h - 1));
+    }
+    for y in 1..h.saturating_sub(1) {
+        push(img.get_pixel(0, y));
+        push(img.get_pixel(w - 1, y));
+    }
+    let mut out = [255u8; 3];
+    for c in 0..3 {
+        ch[c].sort_unstable();
+        if let Some(v) = ch[c].get(ch[c].len() / 2) {
+            out[c] = *v;
+        }
+    }
+    out
+}
+
 /// Отпечаток байтов картинки — чтобы найти одинаковые файлы в одной книге.
 ///
 /// Хеш нужен только как быстрый фильтр: при совпадении байты сравниваются
@@ -1598,11 +1797,31 @@ fn encode_image(
         }
     };
 
-    let (w, h) = (decoded.width(), decoded.height());
-    if w == 0 || h == 0 {
+    let (orig_w, orig_h) = (decoded.width(), decoded.height());
+    if orig_w == 0 || orig_h == 0 {
         return Ok(None);
     }
     let rgba = decoded.to_rgba8();
+
+    // Однотонные поля скана не несут информации, а платим мы за каждый
+    // пиксель. Обрезаем до анализа и до уменьшения — тогда и штрих
+    // измеряется на том кадре, который реально попадёт в книгу.
+    let rgba = if cfg.trim_margins && !is_cover {
+        let (x, y, cw, ch) = trim_margins(&rgba);
+        let before = u64::from(orig_w) * u64::from(orig_h);
+        let after = u64::from(cw) * u64::from(ch);
+        // Меньше 2 % площади — это шум, ради такого рисковать не стоит.
+        if (cw, ch) != (orig_w, orig_h) && after * 100 <= before * 98 {
+            TRIMMED_IMAGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            TRIMMED_PIXELS.fetch_add(before - after, std::sync::atomic::Ordering::Relaxed);
+            image::imageops::crop_imm(&rgba, x, y, cw, ch).to_image()
+        } else {
+            rgba
+        }
+    } else {
+        rgba
+    };
+    let (w, h) = (rgba.width(), rgba.height());
 
     // Графика (текст, схемы) и фотографии сжимаются по-разному: у графики при
     // уменьшении слипаются штрихи, и текст перестаёт читаться.
@@ -1774,21 +1993,41 @@ fn encode_image(
             tally_ns(&STROKE_NS, t_stroke);
             let last = scale >= 0.999;
             if ok || last {
+                let mut cand = cand;
+                // Адаптивное качество: пробуем на шаг ниже и берём результат,
+                // только если он почти не отличается от уже полученного.
+                // Так снимается вес с кадров, где качество 35 было с запасом,
+                // и не трогаются те, где каждый дБ на счету.
+                if cfg.adaptive_quality && !graphic && !small && !is_cover {
+                    let low_quality = quality - cfg.adaptive_step;
+                    if low_quality >= cfg.adaptive_min_quality {
+                        if let Some(accepted) =
+                            try_lower_quality(&prepped, nw, nh, low_quality, speed, gray, opaque, &cand, cfg)
+                        {
+                            ADAPTIVE_IMAGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            ADAPTIVE_SAVED.fetch_add(
+                                (cand.data.len() - accepted.data.len()) as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            cand = accepted;
+                        }
+                    }
+                }
                 avif = Some(cand);
                 break;
             }
         }
         if let Some(cand) = avif {
             return Ok(Some(Encoded {
-                resized: cand.w != w || cand.h != h,
+                resized: cand.w != orig_w || cand.h != orig_h,
                 data: cand.data,
                 format: cand.format,
                 w: cand.w,
                 h: cand.h,
                 lossless: cand.lossless,
                 near_lossless: cand.near_lossless,
-                before_w: w,
-                before_h: h,
+                before_w: orig_w,
+                before_h: orig_h,
             }));
         }
     }
@@ -1825,9 +2064,9 @@ fn encode_image(
         h: best.h,
         lossless: best.lossless,
         near_lossless: best.near_lossless,
-        resized: best.w != w || best.h != h,
-        before_w: w,
-        before_h: h,
+        resized: best.w != orig_w || best.h != orig_h,
+        before_w: orig_w,
+        before_h: orig_h,
     }))
 }
 
@@ -2100,20 +2339,6 @@ fn process_images(input: &Path, cfg: &ImageOptConfig) -> Result<ImageStage> {
             out_entries.push((name, data));
             continue;
         };
-
-        // Наша перекодировка вышла крупнее исходника — значит, сжимать тут
-        // нечего, и единственное, что она даёт, это потерю качества. Такое
-        // бывает на уже хорошо сжатых JPEG и на мелких PNG: исходник
-        // остаётся как есть, вместе со своим именем и ссылками.
-        if enc.data.len() >= data.len() {
-            stats.kept_original += 1;
-            stats.kept_bytes += (enc.data.len() - data.len()) as u64;
-            stats.bytes_after += data.len() as u64;
-            KEPT_ORIGINAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            KEPT_BYTES.fetch_add((enc.data.len() - data.len()) as u64, std::sync::atomic::Ordering::Relaxed);
-            out_entries.push((name, data));
-            continue;
-        }
 
         stats.max_before = (
             stats.max_before.0.max(enc.before_w),
