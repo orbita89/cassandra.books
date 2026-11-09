@@ -1496,15 +1496,32 @@ fn encode_image(
 
     // Лестница от сильного уменьшения к исходному размеру. Последняя ступень
     // всегда 1.0, чтобы было куда отступить.
-    let mut ladder = vec![base];
-    let mut step = base;
-    while step < 0.999 && ladder.len() < 4 {
-        step = (step + 0.1).min(1.0);
-        ladder.push(step);
-    }
-    if ladder.last().is_some_and(|s| *s < 0.999) {
-        ladder.push(1.0);
-    }
+    //
+    // Для графики лестница не нужна: `base` уже посчитан как max(min_scale,
+    // floor, fit*shrink), и штрих после ресайза гарантированно не тоньше
+    // text_min_stroke. Отступать на исходный размер — это ещё одно полное
+    // кодирование AVIF плюс декодирование ради проверки штриха, а разница
+    // «2.0 px → 1.9 px» на глаз не видна. Для фотографий — как раньше.
+    let ladder: Vec<f64> = if graphic {
+        vec![base]
+    } else {
+        let mut l = vec![base];
+        let mut step = base;
+        while step < 0.999 && l.len() < 4 {
+            step = (step + 0.1).min(1.0);
+            l.push(step);
+        }
+        if l.last().is_some_and(|s| *s < 0.999) {
+            l.push(1.0);
+        }
+        l
+    };
+    // Ступень одна — отступать некуда, поэтому проверку штриха можно не
+    // делать: её результат всё равно не может изменить решение, а измерение
+    // стоит полного декодирования закодированного кадра. Без этого признака
+    // графика, не прошедшая проверку, не приняла бы единственного кандидата
+    // (условие `ok || last` при `last == false`) и молча ушла в WebP.
+    let single = ladder.len() == 1;
 
     let speed = pick_avif_speed(w, h, graphic, is_cover, cfg);
 
@@ -1540,7 +1557,8 @@ fn encode_image(
             // Штрих измеряем только там, где картинка реально уменьшалась.
             let shrunk = (nw, nh) != (w, h);
             let t_stroke = std::time::Instant::now();
-            let ok = !graphic
+            let ok = single
+                || !graphic
                 || !shrunk
                 || decoded_stroke(&cand.data) >= cfg.text_min_stroke * 0.75;
             tally_ns(&STROKE_NS, t_stroke);
