@@ -9,7 +9,7 @@
 //!     (для png/gif/bmp/tiff, `near_lossless=60`) и AVIF lossy (через `ravif`,
 //!     чистый Rust, без внешних процессов);
 //!   * картинки в градациях серого кодирует одним каналом, а не тремя;
-//!   * обложку всегда кодирует в AVIF, quality 55;
+//!   * обложку тоже уменьшает на `shrink_percent` и кодирует в AVIF, quality 55;
 //!   * переименовывает файлы и правит ссылки в OPF/XHTML/CSS/NCX, а также
 //!     `href` и `media-type` в `content.opf` (точечно, по `<item>`);
 //!   * минифицирует XHTML/CSS и чистит метаданные Calibre в OPF;
@@ -1583,8 +1583,9 @@ fn encode_image(
 
     // Сколько уменьшать, с каким качеством и ниже какого масштаба нельзя.
     let (shrink, quality, floor, min_scale) = if is_cover {
-        // Обложка только вписывается в лимит: дополнительно не уменьшаем.
-        (0.0, cfg.cover_quality, 1.0, 0.0)
+        // Обложку уменьшаем так же, как всё остальное: на `shrink_percent`.
+        let target = 1.0 - cfg.shrink_percent / 100.0;
+        (cfg.shrink_percent, cfg.cover_quality, target.max(0.5), 0.0)
     } else if graphic {
         // Текст: почти без уменьшения, и только пока штрих остаётся различимым.
         // `text_min_stroke` задан в пикселях, а `stroke` измерен на исходнике,
