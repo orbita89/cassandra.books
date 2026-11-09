@@ -290,7 +290,7 @@ pub fn threads_for(settings: &ImportSettings) -> usize {
 /// zstd жмёт батч целиком и даёт на ~20 % меньше, чем Deflate по книгам:
 /// на 14 тестовых книгах 5.81 МБ против 7.41 МБ. Уровень 19 — колено кривой,
 /// дальше 22 почти не выигрывает, а времени тратит больше.
-pub const ARX_COMPRESSION: &str = "zstd=19";
+pub const ARX_COMPRESSION: &str = "zstd=22";
 
 /// Сообщения из фонового потока в UI.
 #[derive(Debug, Clone)]
