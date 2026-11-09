@@ -1833,16 +1833,21 @@ fn process_images(input: &Path, cfg: &ImageOptConfig) -> Result<ImageStage> {
     let cover_name = find_cover_image(&entries);
     let opf_name = find_opf_name(&entries);
 
-    let raster_names: Vec<&str> = entries
+    // Один проход: is_raster_entry делает ext_lower (аллокация String) и
+    // sniff_image (сравнение сигнатур), три вызова подряд — 2/3 работы зря.
+    let is_raster: Vec<bool> = entries
         .iter()
-        .filter(|(n, d)| is_raster_entry(n, d))
-        .map(|(n, _)| n.as_str())
+        .map(|(n, d)| is_raster_entry(n, d))
         .collect();
-    let raster_idx: Vec<usize> = entries
+    let raster_idx: Vec<usize> = is_raster
         .iter()
         .enumerate()
-        .filter(|(_, (n, d))| is_raster_entry(n, d))
+        .filter(|(_, r)| **r)
         .map(|(i, _)| i)
+        .collect();
+    let raster_names: Vec<&str> = raster_idx
+        .iter()
+        .map(|&i| entries[i].0.as_str())
         .collect();
     let encoded = encode_all(&entries, &raster_idx, cover_name.as_deref(), cfg);
 
@@ -1856,8 +1861,8 @@ fn process_images(input: &Path, cfg: &ImageOptConfig) -> Result<ImageStage> {
     // в каком порядке потоки закончили кодирование.
     let mut enc_iter = raster_names.into_iter().zip(encoded);
 
-    for (name, data) in entries.iter() {
-        if !is_raster_entry(name, data) {
+    for (i, (name, data)) in entries.iter().enumerate() {
+        if !is_raster[i] {
             out_entries.push((name.clone(), data.clone()));
             continue;
         }
