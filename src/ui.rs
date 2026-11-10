@@ -57,6 +57,9 @@ fn top_panel(app: &mut App, ui: &mut egui::Ui) {
     let genres = app.genres.clone();
     let mut filters_changed = false;
     let mut clear_cache = false;
+    let mut page = app.page;
+    let mut page_changed = false;
+    let mut new_page_size: Option<usize> = None;
     let (cache_files, cache_bytes) = app.cache;
 
     egui::Panel::top("top_panel").show(ui, |ui| {
@@ -195,12 +198,22 @@ fn top_panel(app: &mut App, ui: &mut egui::Ui) {
             }
 
             ui.add_space(14.0);
-            ui.label(RichText::new(format!("Найдено: {}", app.results.len())).strong());
-            if app.matched > app.results.len() {
+            let pages = app.pages();
+            let first_index = app.page * app.page_size;
+            let shown_to = (first_index + app.results.len()).min(app.filtered);
+            ui.label(RichText::new(format!("Найдено: {}", app.filtered)).strong());
+            if app.filtered > 0 {
                 ui.label(
-                    RichText::new(format!("из {} подходящих", app.matched))
-                        .small()
-                        .color(Color32::from_gray(150)),
+                    RichText::new(format!(
+                        "книги {}–{} из {}, страница {} из {}",
+                        first_index + 1,
+                        shown_to,
+                        app.filtered,
+                        app.page + 1,
+                        pages
+                    ))
+                    .small()
+                    .color(Color32::from_gray(150)),
                 );
             }
             ui.label(
@@ -208,6 +221,82 @@ fn top_panel(app: &mut App, ui: &mut egui::Ui) {
                     .small()
                     .color(Color32::from_gray(110)),
             );
+
+            // ---- перелистывание выдачи ------------------------------------
+            //
+            // Раньше выдача обрезалась первыми 500 книгами и дальше было не
+            // пролистать: в библиотеке на пару тысяч книг это выглядело как
+            // «вижу только 500 и всё».
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                let at_first = app.page == 0;
+                let at_last = app.page + 1 >= pages;
+
+                if ui
+                    .add_enabled(!at_first, egui::Button::new("⏮"))
+                    .on_hover_text("в начало")
+                    .clicked()
+                {
+                    page = 0;
+                    page_changed = true;
+                }
+                if ui
+                    .add_enabled(!at_first, egui::Button::new("‹ назад"))
+                    .clicked()
+                {
+                    page = app.page.saturating_sub(1);
+                    page_changed = true;
+                }
+
+                let mut shown = app.page + 1;
+                if ui
+                    .add(egui::DragValue::new(&mut shown).range(1..=pages).speed(0.4))
+                    .changed()
+                {
+                    page = shown.saturating_sub(1);
+                    page_changed = true;
+                }
+                ui.label(format!("из {pages}"));
+
+                if ui
+                    .add_enabled(!at_last, egui::Button::new("вперёд ›"))
+                    .clicked()
+                {
+                    page = (app.page + 1).min(pages - 1);
+                    page_changed = true;
+                }
+                if ui
+                    .add_enabled(!at_last, egui::Button::new("⏭"))
+                    .on_hover_text("в конец")
+                    .clicked()
+                {
+                    page = pages - 1;
+                    page_changed = true;
+                }
+
+                ui.separator();
+                ui.label("на странице:");
+                let mut size = app.page_size;
+                egui::ComboBox::from_id_salt("page_size")
+                    .selected_text(size.to_string())
+                    .width(72.0)
+                    .show_ui(ui, |ui| {
+                        for option in crate::db::PAGE_SIZES {
+                            if ui
+                                .selectable_label(size == option, option.to_string())
+                                .clicked()
+                            {
+                                size = option;
+                            }
+                        }
+                    });
+                if size != app.page_size {
+                    // Держим место чтения: первая видимая книга остаётся видимой.
+                    page = (app.page * app.page_size) / size;
+                    page_changed = true;
+                    new_page_size = Some(size);
+                }
+            });
         });
         ui.add_space(6.0);
     });
@@ -215,6 +304,24 @@ fn top_panel(app: &mut App, ui: &mut egui::Ui) {
     if filters_changed {
         app.filter_author = filter_author;
         app.filter_genre = filter_genre;
+        // Фильтр меняет весь список, поэтому возвращаемся на первую страницу.
+        // Раньше смена фильтра вообще не пересчитывала выдачу: она обновлялась
+        // только при следующей правке строки поиска.
+        app.page = 0;
+    }
+    if let Some(size) = new_page_size {
+        app.page_size = size;
+    }
+    if page_changed {
+        app.page = page;
+        // Выделение — это индекс в текущей странице, на новой оно указало бы
+        // на чужую книгу.
+        app.selected = None;
+    }
+    if filters_changed || page_changed {
+        if let Err(err) = app.refresh_search() {
+            app.error = Some(format!("поиск не удался: {err:#}"));
+        }
     }
     if clear_cache {
         app.clear_cache();

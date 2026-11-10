@@ -10,7 +10,8 @@
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -27,7 +28,17 @@ use tantivy::{
 pub const INDEX_MEMORY_BUDGET: usize = 50 * 1024 * 1024;
 
 /// Сколько результатов отдавать на один поисковый запрос по умолчанию.
-pub const DEFAULT_SEARCH_LIMIT: usize = 500;
+///
+/// Это размер **страницы**: выдача листается, а не обрезается на первом
+/// пределе. Раньше здесь стояло 500, и это был весь доступный корпус — дальше
+/// книг просто не было видно.
+pub const DEFAULT_SEARCH_LIMIT: usize = 100;
+
+/// Сколько книг можно запросить одной страницей.
+pub const MAX_PAGE_SIZE: usize = 2000;
+
+/// Размеры страницы, которые предлагает интерфейс.
+pub const PAGE_SIZES: [usize; 6] = [50, 100, 200, 500, 1000, MAX_PAGE_SIZE];
 
 /// Сколько книг Tantivy отдаёт до применения фильтров по автору и жанру.
 /// Ограничение нужно, чтобы запрос не тянул всю библиотеку в память.
@@ -130,7 +141,7 @@ pub struct Details {
 /// Результат поиска вместе с фасетами для фильтров.
 #[derive(Debug, Default)]
 pub struct SearchOutcome {
-    /// Книги после фильтров, отсортированные по названию (не больше `limit`).
+    /// Книги запрошенной страницы после фильтров, по алфавиту.
     pub books: Vec<BookMetadata>,
     /// Автор → сколько книг подошло под текстовый запрос.
     pub authors: Vec<(String, usize)>,
@@ -138,20 +149,69 @@ pub struct SearchOutcome {
     pub genres: Vec<(String, usize)>,
     /// Сколько книг подошло под текстовый запрос (фильтры не учтены).
     pub matched: usize,
+    /// Сколько книг прошло фильтры — по этому числу и листается выдача.
+    pub filtered: usize,
 }
 
-/// Промежуточный накопитель: фасеты и отфильтрованные книги за один проход.
-#[derive(Default)]
+/// Книга в куче отбора страницы.
+///
+/// `Ord` смотрит **только на ключ** (название в нижнем регистре): куча нужна
+/// ровно затем, чтобы оставить `offset + limit` самых левых по алфавиту книг,
+/// а порядок внутри неё значения не имеет.
+struct PageEntry {
+    key: String,
+    book: BookMetadata,
+}
+
+impl Ord for PageEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.key.cmp(&other.key)
+    }
+}
+
+impl PartialOrd for PageEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for PageEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl Eq for PageEntry {}
+
+/// Промежуточный накопитель: фасеты и книги страницы за один проход.
 struct Facets {
     authors: HashMap<String, usize>,
     genres: HashMap<String, usize>,
-    books: Vec<BookMetadata>,
+    /// Сколько книг нужно вместе с пропущенными: `offset + limit`.
+    ///
+    /// Весь корпус в векторе держать нельзя — в библиотеке бывают сотни тысяч
+    /// книг, — поэтому в куче остаются только `keep` самых левых по алфавиту,
+    /// и память не зависит от размера библиотеки.
+    keep: usize,
+    books: BinaryHeap<PageEntry>,
     matched: usize,
+    filtered: usize,
 }
 
 impl Facets {
+    fn new(keep: usize) -> Self {
+        Self {
+            authors: HashMap::new(),
+            genres: HashMap::new(),
+            keep,
+            books: BinaryHeap::new(),
+            matched: 0,
+            filtered: 0,
+        }
+    }
+
     /// Учесть одну книгу: обновить фасеты и, если она проходит фильтры,
-    /// положить её в результат.
+    /// положить её в отбор страницы.
     fn add(&mut self, book: &BookMetadata, author: Option<&str>, genre: Option<&str>) {
         self.matched += 1;
         if !book.author.trim().is_empty() {
@@ -162,8 +222,27 @@ impl Facets {
         }
         let by_author = author.is_none_or(|a| book.author == a);
         let by_genre = genre.is_none_or(|g| book.genres.iter().any(|x| x == g));
-        if by_author && by_genre {
-            self.books.push(book.clone());
+        if !(by_author && by_genre) {
+            return;
+        }
+        self.filtered += 1;
+
+        let key = book.title.to_lowercase();
+        // Книга, которая в алфавите правее самой правой из уже набранных, на
+        // страницу не попадёт — и копировать её незачем.
+        if self.books.len() >= self.keep {
+            if let Some(worst) = self.books.peek() {
+                if key >= worst.key {
+                    return;
+                }
+            }
+        }
+        self.books.push(PageEntry {
+            key,
+            book: book.clone(),
+        });
+        if self.books.len() > self.keep {
+            self.books.pop();
         }
     }
 }
@@ -505,6 +584,7 @@ impl Library {
         query: &str,
         author: Option<&str>,
         genre: Option<&str>,
+        offset: usize,
         limit: usize,
     ) -> Result<SearchOutcome> {
         let query = query.trim();
@@ -517,7 +597,7 @@ impl Library {
             Some(self.full_text_hits(query, SEARCH_FETCH_CAP)?)
         };
 
-        let mut acc = Facets::default();
+        let mut acc = Facets::new(offset.saturating_add(limit));
         match &hits {
             Some(books) => {
                 for book in books {
@@ -531,15 +611,23 @@ impl Library {
             }
         }
 
-        let mut books = acc.books;
-        books.sort_by_key(|b| b.title.to_lowercase());
-        books.truncate(limit);
+        // `into_sorted_vec` отдаёт кучу по возрастанию ключа — это и есть
+        // алфавитный порядок; страница вырезается уже из него.
+        let books = acc
+            .books
+            .into_sorted_vec()
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|e| e.book)
+            .collect();
 
         Ok(SearchOutcome {
             books,
             authors: sort_counts(acc.authors),
             genres: sort_counts(acc.genres),
             matched: acc.matched,
+            filtered: acc.filtered,
         })
     }
 
@@ -804,6 +892,55 @@ mod tests {
         let lib = Library::open(&dir)?;
         assert_eq!(lib.books.len(), 3, "целые книги должны остаться");
         assert!(!lib.books.contains_key(&999), "оборванная запись не читается");
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+    /// Выдача листается страницами: без пропусков, без повторов, по алфавиту.
+    ///
+    /// Страницы собираются кучей ограниченного размера, а не сортировкой всей
+    /// библиотеки, — этот тест стережёт, что отбор при этом остаётся честным.
+    #[test]
+    fn search_pages_partition_the_result() -> Result<()> {
+        let dir = scratch("paging");
+        let books: Vec<BookMetadata> = (1..=25u64).map(sample_book).collect();
+        {
+            let lib = Library::open(&dir)?;
+            lib.append_metadata("1-25", &books)?;
+        }
+        let lib = Library::open(&dir)?;
+
+        // По три книги на страницу: девять страниц, последняя неполная.
+        let mut seen: Vec<u64> = Vec::new();
+        for page in 0..9 {
+            let out = lib.search("", None, None, page * 3, 3)?;
+            assert_eq!(out.matched, 25, "всего книг в выдаче");
+            assert!(out.books.len() <= 3, "страница не больше запрошенного");
+            seen.extend(out.books.iter().map(|b| b.id));
+        }
+        assert_eq!(seen.len(), 25, "страницы должны покрыть всю выдачу");
+        let mut unique = seen.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), 25, "одна книга не должна попасть дважды");
+
+        // Сквозной алфавитный порядок: страница продолжает предыдущую.
+        let all = lib.search("", None, None, 0, 25)?;
+        assert_eq!(all.books.len(), 25);
+        assert!(
+            all.books.windows(2).all(|w| w[0].title <= w[1].title),
+            "выдача должна идти по алфавиту"
+        );
+        assert_eq!(
+            all.books.iter().map(|b| b.id).collect::<Vec<_>>(),
+            seen,
+            "страницы и цельная выдача — один и тот же порядок"
+        );
+
+        // Смещение за пределами выдачи даёт пустую страницу, а не панику.
+        let tail = lib.search("", None, None, 100, 10)?;
+        assert!(tail.books.is_empty());
+        assert_eq!(tail.matched, 25);
+
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }

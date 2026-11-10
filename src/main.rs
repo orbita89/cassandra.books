@@ -82,10 +82,16 @@ pub struct App {
     pub query: String,
     /// Запрос, по которому построен текущий `results`.
     pub last_query: String,
-    /// Найденные книги (после фильтров).
+    /// Книги текущей страницы (после фильтров).
     pub results: Vec<BookMetadata>,
+    /// Номер страницы выдачи, с нуля.
+    pub page: usize,
+    /// Сколько книг показывать на странице.
+    pub page_size: usize,
     /// Сколько всего книг подошло под текстовый запрос (до фильтров).
     pub matched: usize,
+    /// Сколько книг прошло фильтры — по этому числу считается листание.
+    pub filtered: usize,
     /// Фильтр по автору — точное совпадение; `None` значит «все».
     pub filter_author: Option<String>,
     /// Фильтр по жанру — точное совпадение; `None` значит «все».
@@ -124,7 +130,10 @@ impl App {
             query: String::new(),
             last_query: String::new(),
             results: Vec::new(),
+            page: 0,
+            page_size: db::DEFAULT_SEARCH_LIMIT,
             matched: 0,
+            filtered: 0,
             filter_author: None,
             filter_genre: None,
             authors: Vec::new(),
@@ -144,18 +153,42 @@ impl App {
         Ok(app)
     }
 
-    /// Пересчитать выдачу по текущему запросу и фильтрам.
+    /// Сколько страниц в текущей выдаче (минимум одна).
+    pub fn pages(&self) -> usize {
+        self.filtered.div_ceil(self.page_size.max(1)).max(1)
+    }
+
+    /// Пересчитать выдачу по текущему запросу, фильтрам и номеру страницы.
     pub fn refresh_search(&mut self) -> Result<()> {
-        let outcome = self.library.search(
-            &self.query,
-            self.filter_author.as_deref(),
-            self.filter_genre.as_deref(),
-            db::DEFAULT_SEARCH_LIMIT,
-        )?;
-        self.results = outcome.books;
-        self.authors = outcome.authors;
-        self.genres = outcome.genres;
-        self.matched = outcome.matched;
+        // Новый запрос всегда открывается с первой страницы; перелистывание
+        // запрос не меняет, поэтому страницу не сбрасывает.
+        if self.query != self.last_query {
+            self.page = 0;
+        }
+        self.page_size = self.page_size.clamp(1, db::MAX_PAGE_SIZE);
+
+        loop {
+            let outcome = self.library.search(
+                &self.query,
+                self.filter_author.as_deref(),
+                self.filter_genre.as_deref(),
+                self.page * self.page_size,
+                self.page_size,
+            )?;
+            self.matched = outcome.matched;
+            self.filtered = outcome.filtered;
+            let pages = self.pages();
+            // Страница могла исчезнуть — например, после смены фильтра книг
+            // стало меньше. Тогда показываем последнюю, а не пустоту.
+            if self.page >= pages {
+                self.page = pages - 1;
+                continue;
+            }
+            self.results = outcome.books;
+            self.authors = outcome.authors;
+            self.genres = outcome.genres;
+            break;
+        }
         self.last_query = self.query.clone();
 
         // Выбранная книга могла исчезнуть из выдачи после смены фильтра.
@@ -520,12 +553,23 @@ fn main() -> eframe::Result<()> {
         let mut data_dir_set = false;
         let mut author: Option<String> = None;
         let mut genre: Option<String> = None;
+        let mut page = 1usize;
+        let mut per_page = db::DEFAULT_SEARCH_LIMIT;
 
         let mut it = args[1..].iter();
         while let Some(arg) = it.next() {
             match arg.as_str() {
                 "--author" => author = it.next().cloned(),
                 "--genre" => genre = it.next().cloned(),
+                // Листание выдачи из консоли — тем же кодом, что и в окне.
+                "--page" => page = it.next().and_then(|v| v.parse().ok()).unwrap_or(1),
+                "--per-page" => {
+                    per_page = it
+                        .next()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(db::DEFAULT_SEARCH_LIMIT)
+                        .clamp(1, db::MAX_PAGE_SIZE)
+                }
                 _ if !query_set => {
                     query = arg.clone();
                     query_set = true;
@@ -542,6 +586,8 @@ fn main() -> eframe::Result<()> {
             data_dir,
             author.as_deref(),
             genre.as_deref(),
+            page.max(1),
+            per_page,
         ));
     }
 
@@ -835,6 +881,8 @@ fn run_headless_search(
     data_dir: PathBuf,
     author: Option<&str>,
     genre: Option<&str>,
+    page: usize,
+    per_page: usize,
 ) -> i32 {
     let library = match Library::open(&data_dir) {
         Ok(l) => l,
@@ -845,16 +893,18 @@ fn run_headless_search(
     };
     emit(format!("книг в библиотеке: {}", library.books.len()));
 
-    let hits = match library.search(query, author, genre, db::DEFAULT_SEARCH_LIMIT) {
+    let offset = (page - 1).saturating_mul(per_page);
+    let hits = match library.search(query, author, genre, offset, per_page) {
         Ok(h) => h,
         Err(err) => {
             eprintln!("[фатально] поиск не удался: {err:#}");
             return 2;
         }
     };
+    let pages = hits.filtered.div_ceil(per_page).max(1);
     emit(format!(
-        "по запросу `{query}` найдено: {} (показано {}){}",
-        hits.matched,
+        "по запросу `{query}` найдено: {} (страница {page} из {pages}, показано {}){}",
+        hits.filtered,
         hits.books.len(),
         match (author, genre) {
             (None, None) => String::new(),
@@ -924,5 +974,163 @@ impl eframe::App for App {
     /// Основная отрисовка кадра.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         ui::draw(self, ui);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Тестовая книга с минимальными полями.
+    fn sample_book(id: u64, title: &str) -> BookMetadata {
+        BookMetadata {
+            id,
+            title: title.to_string(),
+            author: "Тестовый автор".to_string(),
+            genre_codes: Vec::new(),
+            genres: Vec::new(),
+            archive: "1-1.arx".to_string(),
+            internal_path: format!("{id}.epub"),
+            cover: None,
+            details: db::Details::default(),
+            size: 100,
+        }
+    }
+
+    /// Приложение листает выдачу по страницам и не выходит за её пределы.
+    ///
+    /// Это уровень, который видит интерфейс: `App::refresh_search` сам
+    /// прижимает страницу к последней, когда фильтр сократил выдачу.
+    #[test]
+    fn app_pages_through_the_library() -> Result<()> {
+        let dir = std::env::temp_dir().join("library_gui_test_app_paging");
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let lib = Library::open(&dir)?;
+            let books: Vec<BookMetadata> =
+                (1..=25).map(|i| sample_book(i, &format!("Книга {i:02}"))).collect();
+            lib.append_metadata("1-25", &books)?;
+        }
+
+        let mut app = App::new(dir.clone())?;
+        // `App::new` уже открыл первую страницу с размером по умолчанию;
+        // пересчитываем её уже с нужным размером.
+        app.page_size = 10;
+        app.refresh_search()?;
+        assert_eq!(app.matched, 25, "все 25 книг в выдаче");
+        assert_eq!(app.pages(), 3, "три страницы по десять");
+        assert_eq!(app.page, 0);
+        assert_eq!(app.results.len(), 10);
+
+        let mut seen: Vec<u64> = app.results.iter().map(|b| b.id).collect();
+        for page in 1..3 {
+            app.page = page;
+            app.refresh_search()?;
+            let expect = if page == 2 { 5 } else { 10 };
+            assert_eq!(app.results.len(), expect, "страница {page}");
+            seen.extend(app.results.iter().map(|b| b.id));
+        }
+        let mut unique = seen.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), 25, "страницы покрывают все книги без повторов");
+
+        // Номер страницы за пределами выдачи — прижимается к последней,
+        // а не показывает пустоту.
+        app.page = 99;
+        app.refresh_search()?;
+        assert_eq!(app.page, 2, "страница прижата к последней");
+        assert_eq!(app.results.len(), 5);
+
+        // Фильтр, под который ничего не подходит, обнуляет выдачу и страницу.
+        app.page = 2;
+        app.filter_author = Some("Никого".to_string());
+        app.refresh_search()?;
+        assert_eq!(app.filtered, 0, "фильтр не пропускает ни одной книги");
+        assert_eq!(app.matched, 25, "по тексту подходят все 25");
+        assert_eq!(app.page, 0, "страница сбрасывается в первую");
+        assert!(app.results.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+    /// Собрать весь текст, который интерфейс отрисовал в кадре.
+    fn collect_texts(shape: &egui::Shape, out: &mut Vec<String>) {
+        match shape {
+            egui::Shape::Text(t) => out.push(t.galley.text().to_string()),
+            egui::Shape::Vec(items) => {
+                for item in items {
+                    collect_texts(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Отрисовка кадра показывает счётчик и перелистывание страниц.
+    ///
+    /// Это проверка того, что видит пользователь: интерфейс рисуется
+    /// без окна, а в кадре действительно есть текст «страница N из M» и
+    /// кнопки перелистывания. Раньше на этом месте стояла только обрезка
+    /// по 500 книг, и дальше выдачи было не видно.
+    #[test]
+    fn ui_renders_paging_controls() -> Result<()> {
+        let dir = std::env::temp_dir().join("library_gui_test_ui_paging");
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let lib = Library::open(&dir)?;
+            let books: Vec<BookMetadata> =
+                (1..=25).map(|i| sample_book(i, &format!("Книга {i:02}"))).collect();
+            lib.append_metadata("1-25", &books)?;
+        }
+
+        let mut app = App::new(dir.clone())?;
+        app.page_size = 10;
+        app.refresh_search()?;
+
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        // Первый кадр панель получает высоту по содержимому, поэтому текст
+        // рисуется уже во втором. Дальше оба кадра делают одно и то же.
+        let frame = |app: &mut App| {
+            let mut out = ctx.run_ui(input.clone(), |ui| {
+                ui::draw(app, ui);
+            });
+            out.textures_delta.clear();
+            out
+        };
+        frame(&mut app);
+        let output = frame(&mut app);
+
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            collect_texts(&clipped.shape, &mut texts);
+        }
+        let all = texts.join(" | ");
+        assert!(
+            all.contains("Найдено: 25"),
+            "в кадре нет счётчика найденных книг: {all}"
+        );
+        assert!(
+            all.contains("страница 1 из 3"),
+            "в кадре нет номера страницы: {all}"
+        );
+        assert!(
+            all.contains("вперёд") && all.contains("назад"),
+            "в кадре нет кнопок перелистывания: {all}"
+        );
+        assert!(
+            all.contains("на странице"),
+            "в кадре нет выбора размера страницы: {all}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
     }
 }
