@@ -335,6 +335,7 @@ fn write_import_log(
     skipped: usize,
     foreign: &[ForeignBook],
     duplicates: &[(u64, u64)],
+    failures: &[(u64, String, String)],
 ) {
     let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
     let mut s = String::new();
@@ -396,6 +397,21 @@ fn write_import_log(
                 f.stats.cyrillic_share() * 100.0,
                 f.stats.foreign_share() * 100.0,
             ));
+        }
+    }
+
+    // Книги, которые не удалось собрать. Исходные FB2 перед удалением ZIP
+    // отложены рядом, поэтому разобраться с ними можно и потом.
+    if !failures.is_empty() {
+        s.push('\n');
+        s.push_str("Не попали в архив: не удалось собрать\n");
+        s.push_str("=============================================================\n");
+        s.push_str(&format!(
+            "Исходные FB2 сохранены в {} — ZIP после импорта удаляется.\n\n",
+            data_dir.join("failed").join(batch_name).display()
+        ));
+        for (id, file, err) in failures {
+            s.push_str(&format!("{id} | {file} | {err}\n"));
         }
     }
 
@@ -579,11 +595,13 @@ pub struct ImportSettings {
     pub jobs: usize,
     /// Аргумент `-c` для `arx create`: `zstd=19`, `none`, `lzma=9`…
     pub arx_compression: String,
-    /// Удалить исходный ZIP после успешного импорта.
+    /// Удалить исходный ZIP после импорта.
     ///
-    /// Именно **после успешного**: если хоть одна книга не собралась, архив
-    /// остаётся, иначе переимпорт стал бы невозможен. По умолчанию выключено —
-    /// это разрушительное действие, и включать его должен пользователь.
+    /// Удаляем, как только импорт доехал до конца, — даже если отдельные
+    /// книги не собрались: их исходники заранее откладываются в
+    /// `data/failed/<партия>/`, так что потерять книгу нельзя. Не удаляем
+    /// только при фатальной ошибке, когда архив вообще не открылся.
+    /// По умолчанию выключено — это разрушительное действие.
     pub delete_zip: bool,
 }
 
@@ -834,12 +852,29 @@ fn run_import(
 
     let mut batch: Vec<BookMetadata> = Vec::with_capacity(total);
     let mut foreign: Vec<ForeignBook> = Vec::new();
-    for (_, r) in results {
+    // Неудавшиеся книги: (id, файл, ошибка). Исходники откладываем в
+    // `data/failed/<партия>/`, чтобы после удаления ZIP их можно было
+    // разобрать, а не искать заново.
+    let mut failures: Vec<(u64, String, String)> = Vec::new();
+    let failed_dir = data_dir.join("failed").join(&batch_name);
+    for (i, r) in results {
         // Ошибку уже отправили в UI выше.
         match r {
             Ok(BookOutcome::Ready(book, _warnings)) => batch.push(*book),
             Ok(BookOutcome::Foreign(f)) => foreign.push(*f),
-            Err(_) => {}
+            Err(err) => {
+                let fb2 = &fb2_files[i];
+                let stem = file_stem(fb2);
+                if settings.delete_zip {
+                    if let Err(copy_err) = keep_failed_source(fb2, &failed_dir) {
+                        eprintln!(
+                            "[!] не удалось отложить {}: {copy_err:#}",
+                            fb2.display()
+                        );
+                    }
+                }
+                failures.push((parse_id(&stem), stem, format!("{err:#}")));
+            }
         }
     }
 
@@ -933,10 +968,16 @@ fn run_import(
         skipped.load(Ordering::Relaxed),
         &foreign,
         &duplicates,
+        &failures,
     );
-    // Автоудаление исходного ZIP. Только после успешного импорта: если хоть
-    // одна книга не собралась, архив остаётся — иначе переимпорт невозможен.
-    let deleted = if settings.delete_zip && failed_books == 0 {
+    // Автоудаление исходного ZIP. Условие одно: импорт доехал до конца.
+    // Ошибки отдельных книг удаление не отменяют — иначе один битый FB2 из
+    // тысячи держал бы на диске полгигабайта. Их исходники уже отложены в
+    // `data/failed/<партия>/`, поэтому потерять книгу нельзя.
+    //
+    // Не удаляем только при фатальной ошибке (архив не открылся): тогда
+    // `Finished` не отправляется вовсе, а ZIP остаётся на месте.
+    let deleted = if settings.delete_zip {
         match fs::remove_file(zip) {
             Ok(()) => {
                 eprintln!("[✓] исходный ZIP удалён: {}", zip.display());
@@ -958,6 +999,23 @@ fn run_import(
         seconds: started.elapsed().as_secs_f64(),
         deleted,
     });
+    Ok(())
+}
+
+/// Отложить FB2, который не собрался, в `data/failed/<партия>/`.
+///
+/// ZIP удаляется после импорта, поэтому копия — единственный способ
+/// разобраться с книгой потом. Файлы небольшие, но их потеря была бы
+/// необратимой.
+fn keep_failed_source(fb2: &Path, dir: &Path) -> Result<()> {
+    fs::create_dir_all(dir)
+        .with_context(|| format!("не удалось создать {}", dir.display()))?;
+    let name = fb2
+        .file_name()
+        .with_context(|| format!("у {} нет имени файла", fb2.display()))?;
+    let dst = dir.join(name);
+    fs::copy(fb2, &dst)
+        .with_context(|| format!("не удалось скопировать {} в {}", fb2.display(), dst.display()))?;
     Ok(())
 }
 

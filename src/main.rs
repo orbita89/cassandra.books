@@ -100,6 +100,178 @@ impl ImportState {
     }
 }
 
+/// Окно выбора ZIP-архивов: список файлов каталога с галочками.
+///
+/// Нужно потому, что системный диалог отмечает несколько файлов только
+/// Ctrl+кликом и не показывает, что уже импортировано. Здесь — обычные
+/// галочки, размер и пометка «уже импортирован».
+#[derive(Debug)]
+pub struct ZipPicker {
+    /// Каталог, содержимое которого показано.
+    pub dir: PathBuf,
+    /// Подстрока для фильтра по имени.
+    pub filter: String,
+    /// Найденные ZIP-архивы, по алфавиту.
+    pub entries: Vec<ZipEntry>,
+    /// Ошибка чтения каталога — показывается в окне.
+    pub error: Option<String>,
+}
+
+/// Один ZIP в списке выбора.
+#[derive(Debug)]
+pub struct ZipEntry {
+    /// Полный путь.
+    pub path: PathBuf,
+    /// Имя файла без каталогов.
+    pub name: String,
+    /// Размер в байтах.
+    pub size: u64,
+    /// Похоже, что этот диапазон уже собран: в `data/archives` есть `.arx`.
+    pub imported: bool,
+    /// Стоит ли галочка.
+    pub checked: bool,
+}
+
+impl ZipPicker {
+    /// Прочитать каталог и собрать список ZIP.
+    pub fn open(dir: PathBuf, archives_dir: &Path) -> Self {
+        let mut picker = Self {
+            dir,
+            filter: String::new(),
+            entries: Vec::new(),
+            error: None,
+        };
+        picker.rescan(archives_dir);
+        picker
+    }
+
+    /// Перечитать каталог, сохранив уже поставленные галочки.
+    pub fn rescan(&mut self, archives_dir: &Path) {
+        let previous: Vec<PathBuf> = self
+            .entries
+            .iter()
+            .filter(|e| e.checked)
+            .map(|e| e.path.clone())
+            .collect();
+        match scan_zips(&self.dir, archives_dir) {
+            Ok(mut entries) => {
+                for entry in &mut entries {
+                    entry.checked = previous.contains(&entry.path);
+                }
+                self.entries = entries;
+                self.error = None;
+            }
+            Err(err) => {
+                self.entries.clear();
+                self.error = Some(err);
+            }
+        }
+    }
+
+    /// Номера записей, подходящих под фильтр (без учёта регистра).
+    pub fn visible_indices(&self) -> Vec<usize> {
+        let needle = self.filter.trim().to_lowercase();
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| needle.is_empty() || e.name.to_lowercase().contains(&needle))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Поставить или снять галочки у всего, что видно сейчас.
+    pub fn set_visible(&mut self, checked: bool) {
+        for i in self.visible_indices() {
+            self.entries[i].checked = checked;
+        }
+    }
+
+    /// Отметить видимые архивы, которых ещё нет в библиотеке.
+    pub fn check_only_new(&mut self) {
+        for i in self.visible_indices() {
+            self.entries[i].checked = !self.entries[i].imported;
+        }
+    }
+
+    /// Сколько выбрано: (файлов, байт).
+    pub fn checked_stats(&self) -> (usize, u64) {
+        self.entries
+            .iter()
+            .filter(|e| e.checked)
+            .fold((0, 0), |(n, bytes), e| (n + 1, bytes + e.size))
+    }
+
+    /// Пути выбранных архивов в порядке списка.
+    pub fn checked_paths(&self) -> Vec<PathBuf> {
+        self.entries
+            .iter()
+            .filter(|e| e.checked)
+            .map(|e| e.path.clone())
+            .collect()
+    }
+}
+
+/// Найти в каталоге все ZIP-архивы.
+fn scan_zips(dir: &Path, archives_dir: &Path) -> std::result::Result<Vec<ZipEntry>, String> {
+    let rd = std::fs::read_dir(dir)
+        .map_err(|err| format!("не удалось прочитать {}: {err}", dir.display()))?;
+    let archives = archive_names(archives_dir);
+    let mut entries = Vec::new();
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if !path.is_file() || !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip")) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        // Диапазон id из имени файла — подсказка, а не приговор: галочку
+        // всё равно ставит человек, и переимпорт по-прежнему возможен.
+        let imported = id_range(&name).is_some_and(|(lo, hi)| {
+            let base = format!("{lo}-{hi}");
+            let prefixed = format!("{base}-");
+            archives.iter().any(|a| *a == base || a.starts_with(&prefixed))
+        });
+        entries.push(ZipEntry {
+            path,
+            name,
+            size,
+            imported,
+            checked: false,
+        });
+    }
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(entries)
+}
+
+/// Имена собранных партий (`821884-824013`, `1-1-2`) без расширения `.arx`.
+fn archive_names(archives_dir: &Path) -> Vec<String> {
+    std::fs::read_dir(archives_dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    name.strip_suffix(".arx").map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Диапазон id из имени файла: `fb2-806448-808070.zip` → `(806448, 808070)`.
+///
+/// В корпусе lib.rus.ec имя архива — это диапазон id, и партия импорта
+/// называется так же. Если имя разобрать не удалось, подсказки просто нет.
+fn id_range(file_name: &str) -> Option<(u64, u64)> {
+    let stem = file_name.rsplit_once('.').map_or(file_name, |(s, _)| s);
+    let parts: Vec<&str> = stem.split('-').collect();
+    parts.windows(2).find_map(|w| {
+        match (w[0].parse::<u64>(), w[1].parse::<u64>()) {
+            (Ok(lo), Ok(hi)) => Some((lo, hi)),
+            _ => None,
+        }
+    })
+}
+
 /// Всё состояние приложения.
 pub struct App {
     /// Открытая библиотека (индекс + метаданные).
@@ -136,6 +308,10 @@ pub struct App {
     pub import: ImportState,
     /// ZIP-архивы, ждущие импорта. Обрабатываются строго по одному.
     pub import_queue: VecDeque<PathBuf>,
+    /// Открытое окно выбора архивов (галочками), если оно открыто.
+    pub zip_picker: Option<ZipPicker>,
+    /// Каталог, который показывать в окне выбора архивов.
+    pub zip_dir: Option<PathBuf>,
     /// Ошибка, которую надо показать в окне.
     pub error: Option<String>,
     /// Короткое сообщение об успехе.
@@ -171,6 +347,8 @@ impl App {
             cache: (0, 0),
             import: ImportState::default(),
             import_queue: VecDeque::new(),
+            zip_picker: None,
+            zip_dir: None,
             error: None,
             toast: None,
             rx,
@@ -294,11 +472,25 @@ impl App {
         self.start_next_import();
     }
 
+    /// Открыть окно выбора архивов: список `.zip` в каталоге с галочками.
+    pub fn open_zip_picker(&mut self) {
+        let dir = self
+            .zip_dir
+            .clone()
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Downloads")))
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let archives = self.library.archives_dir();
+        self.zip_picker = Some(ZipPicker::open(dir, &archives));
+    }
+
     /// Запустить следующий архив из очереди. `false` — очередь пуста.
     fn start_next_import(&mut self) -> bool {
         let Some(zip) = self.import_queue.pop_front() else {
             return false;
         };
+        // Каталог запоминаем: в следующий раз окно выбора откроется в нём.
+        self.zip_dir = zip.parent().map(Path::to_path_buf);
         self.import.index += 1;
         self.import.current = Some(display_name(&zip));
         self.import.queue = self.import_queue.iter().map(|p| display_name(p)).collect();
@@ -546,7 +738,8 @@ fn main() -> eframe::Result<()> {
             "  library_gui [data_dir]                    окно (data_dir по умолчанию `data`)\n",
             "  library_gui --import <zip>… [data_dir] [--delete]\n",
             "                                            импорт без окна; архивов\n",
-            "                                            можно несколько — по очереди\n",
+            "                                            можно несколько — по очереди,\n",
+            "                                            --delete удаляет исходники\n",
             "  library_gui --search <запрос> [data_dir] [--author X] [--genre Y]\n",
             "                                            поиск без окна\n",
             "  library_gui --convert <fb2> <epub>         конвертация FB2 → EPUB 3.3\n",
@@ -563,6 +756,7 @@ fn main() -> eframe::Result<()> {
             "  index/          индекс Tantivy для поиска\n",
             "  metadata/       метаданные книг, по файлу на входной ZIP\n",
             "  imports/        отчёты об импорте, по файлу на входной ZIP\n",
+            "  failed/         FB2, которые не собрались (копия перед удалением ZIP)\n",
         ));
         std::process::exit(0);
     }
@@ -1366,7 +1560,7 @@ mod tests {
             "в кадре нет очереди архивов: {all}"
         );
 
-        // Оставленный из-за ошибок исходник тоже должен быть виден.
+        // Исходник, который не удалось удалить, тоже должен быть виден.
         app.import.queue.clear();
         app.import.running = false;
         app.import.kept = vec!["первый.zip".to_string()];
@@ -1378,8 +1572,100 @@ mod tests {
         }
         let all = texts.join(" | ");
         assert!(
-            all.contains("оставлено из-за ошибок") && all.contains("первый.zip"),
-            "в кадре нет сведений об оставленном исходнике: {all}"
+            all.contains("не удалось удалить") && all.contains("первый.zip"),
+            "в кадре нет сведений о неудалённом исходнике: {all}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Окно выбора архивов находит ZIP, помечает уже собранные диапазоны и
+    /// отдаёт на импорт только отмеченные файлы.
+    #[test]
+    fn zip_picker_scans_and_checks() -> Result<()> {
+        let dir = std::env::temp_dir().join("library_gui_test_zip_picker");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("fb2-1-9.zip"), b"x")?;
+        std::fs::write(dir.join("fb2-10-19.zip"), b"xx")?;
+        std::fs::write(dir.join("не-архив.txt"), b"x")?;
+        let archives = dir.join("archives");
+        std::fs::create_dir_all(&archives)?;
+        std::fs::write(archives.join("1-9.arx"), b"x")?;
+
+        let mut picker = ZipPicker::open(dir.clone(), &archives);
+        assert_eq!(picker.entries.len(), 2, "в списке только ZIP-архивы");
+        assert!(
+            picker
+                .entries
+                .iter()
+                .any(|e| e.name == "fb2-1-9.zip" && e.imported),
+            "архив с собранным диапазоном должен быть помечен"
+        );
+        assert!(
+            picker
+                .entries
+                .iter()
+                .any(|e| e.name == "fb2-10-19.zip" && !e.imported),
+            "новый диапазон помечать нечем"
+        );
+
+        // «Только не импортированные» отмечает ровно новый архив.
+        picker.check_only_new();
+        assert_eq!(picker.checked_stats().0, 1);
+        assert_eq!(picker.checked_paths(), vec![dir.join("fb2-10-19.zip")]);
+
+        // Фильтр сужает список, а «снять/отметить все» работает по видимым.
+        picker.set_visible(false);
+        picker.filter = "1-9".to_string();
+        assert_eq!(picker.visible_indices().len(), 1, "фильтр по подстроке");
+        picker.set_visible(true);
+        assert_eq!(picker.checked_paths(), vec![dir.join("fb2-1-9.zip")]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Окно выбора архивов действительно рисуется и показывает файлы.
+    #[test]
+    fn ui_renders_zip_picker() -> Result<()> {
+        let dir = std::env::temp_dir().join("library_gui_test_ui_picker");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let mut app = App::new(dir.clone())?;
+        std::fs::write(dir.join("fb2-1-9.zip"), b"x")?;
+        app.zip_dir = Some(dir.clone());
+        app.open_zip_picker();
+
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let frame = |app: &mut App| {
+            let mut out = ctx.run_ui(input.clone(), |ui| {
+                ui::draw(app, ui);
+            });
+            out.textures_delta.clear();
+            out
+        };
+        frame(&mut app);
+        let output = frame(&mut app);
+
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            collect_texts(&clipped.shape, &mut texts);
+        }
+        let all = texts.join(" | ");
+        assert!(all.contains("Выбор ZIP-архивов"), "нет окна выбора: {all}");
+        assert!(all.contains("fb2-1-9.zip"), "нет списка архивов: {all}");
+        assert!(
+            all.contains("Импортировать выбранные"),
+            "нет кнопки импорта выбранных: {all}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -35,6 +35,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     cover_grid(app, ui);
     book_window(app, ui);
     error_window(app, ui);
+    zip_picker_window(app, ui);
 
     // Поиск «на лету»: как только текст изменился — пересчитываем результаты.
     if app.query != app.last_query {
@@ -98,26 +99,18 @@ fn top_panel(app: &mut App, ui: &mut egui::Ui) {
             // в очередь и пойдут следующими.
             if ui
                 .button("📥 Импортировать ZIP…")
-                .on_hover_text(
-                    "Можно выбрать сразу несколько архивов — они импортируются по очереди.",
-                )
+                .on_hover_text("Открыть список архивов с галочками: можно отметить сразу много.")
                 .clicked()
             {
-                if let Some(paths) = rfd::FileDialog::new()
-                    .add_filter("ZIP-архив с FB2", &["zip"])
-                    .set_title("Выберите ZIP-архивы с FB2 (можно несколько)")
-                    .pick_files()
-                {
-                    app.start_imports(paths);
-                }
+                app.open_zip_picker();
             }
             let mut delete_zip = app.settings.delete_zip;
             if ui
                 .checkbox(&mut delete_zip, "удалять ZIP")
                 .on_hover_text(
-                    "Удалять исходный архив после успешного импорта.\n\
-                     Если хоть одна книга не собралась, архив остаётся — \
-                     иначе переимпорт был бы невозможен.",
+                    "Удалять исходный архив, когда импорт доехал до конца.\n\
+                     Книги, которые не собрались, заранее откладываются в\n\
+                     data/failed/<партия>/ — поэтому ничего не теряется.",
                 )
                 .changed()
             {
@@ -780,7 +773,7 @@ fn bottom_panel(app: &mut App, ui: &mut egui::Ui) {
         }
         if !app.import.kept.is_empty() {
             summary.push(format!(
-                "оставлено из-за ошибок: {} ({})",
+                "не удалось удалить: {} ({})",
                 app.import.kept.len(),
                 app.import.kept.join(", ")
             ));
@@ -811,6 +804,21 @@ fn bottom_panel(app: &mut App, ui: &mut egui::Ui) {
                 .small()
                 .color(Color32::from_gray(180)),
             );
+        }
+
+        // Неудавшиеся книги не теряются: их исходники отложены в data/failed/.
+        if !app.import.running {
+            if let Some((_, failed, _)) = app.import.finished {
+                if failed > 0 {
+                    ui.label(
+                        RichText::new(format!(
+                            "⚠ не собралось книг: {failed} — исходные FB2 отложены в data/failed/"
+                        ))
+                        .small()
+                        .color(Color32::from_rgb(220, 190, 120)),
+                    );
+                }
+            }
         }
 
         if app.import.defects > 0 {
@@ -875,5 +883,179 @@ fn error_window(app: &mut App, ui: &mut egui::Ui) {
         });
     if !open {
         app.error = None;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Окно выбора архивов
+// ---------------------------------------------------------------------------
+
+/// Список ZIP-архивов каталога с галочками.
+///
+/// Системный диалог выбирает несколько файлов только Ctrl+кликом и ничего
+/// не говорит о том, что уже импортировано. Здесь — обычные галочки, размер
+/// и пометка «уже импортирован»: можно отметить сразу весь заход.
+fn zip_picker_window(app: &mut App, ui: &mut egui::Ui) {
+    let Some(mut picker) = app.zip_picker.take() else {
+        return;
+    };
+    let ctx = ui.ctx().clone();
+    let archives_dir = app.library.archives_dir();
+    // Архивы, которые уже стоят в очереди или импортируются прямо сейчас.
+    let busy: Vec<String> = app
+        .import
+        .current
+        .iter()
+        .chain(app.import.queue.iter())
+        .cloned()
+        .collect();
+
+    let mut open = true;
+    let mut close = false;
+    let mut choose_dir = false;
+    let mut rescan = false;
+    let mut import = false;
+
+    egui::Window::new("Выбор ZIP-архивов")
+        .collapsible(false)
+        .resizable(true)
+        .default_width(780.0)
+        .open(&mut open)
+        .show(&ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Папка:");
+                ui.label(RichText::new(picker.dir.display().to_string()).strong());
+                if ui.button("Другая папка…").clicked() {
+                    choose_dir = true;
+                }
+                if ui.button("Обновить").clicked() {
+                    rescan = true;
+                }
+            });
+            if let Some(err) = &picker.error {
+                ui.label(RichText::new(err).color(Color32::from_rgb(240, 120, 120)));
+            }
+
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Фильтр:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut picker.filter)
+                        .hint_text("часть имени, например 806")
+                        .desired_width(200.0),
+                );
+                if ui.button("отметить все").clicked() {
+                    picker.set_visible(true);
+                }
+                if ui.button("снять все").clicked() {
+                    for entry in &mut picker.entries {
+                        entry.checked = false;
+                    }
+                }
+                if ui.button("только не импортированные").clicked() {
+                    picker.check_only_new();
+                }
+            });
+            ui.separator();
+
+            let visible = picker.visible_indices();
+            let row_h = ui.spacing().interact_size.y + ui.spacing().item_spacing.y;
+            egui::ScrollArea::vertical()
+                .max_height(360.0)
+                .auto_shrink([false, true])
+                .show_rows(ui, row_h, visible.len(), |ui, range| {
+                    for &i in &visible[range] {
+                        let entry = &mut picker.entries[i];
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut entry.checked, "");
+                            let label = if entry.imported {
+                                RichText::new(&entry.name).color(Color32::from_gray(140))
+                            } else {
+                                RichText::new(&entry.name)
+                            };
+                            ui.label(label);
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(human_size(entry.size))
+                                            .small()
+                                            .color(Color32::from_gray(140)),
+                                    );
+                                    if busy.contains(&entry.name) {
+                                        ui.label(
+                                            RichText::new("в очереди")
+                                                .small()
+                                                .color(Color32::from_rgb(200, 190, 120)),
+                                        );
+                                    } else if entry.imported {
+                                        ui.label(
+                                            RichText::new("уже импортирован")
+                                                .small()
+                                                .color(Color32::from_rgb(140, 200, 140)),
+                                        );
+                                    }
+                                },
+                            );
+                        });
+                    }
+                });
+            if visible.is_empty() {
+                ui.label(
+                    RichText::new("подходящих ZIP-архивов в этой папке нет")
+                        .color(Color32::from_gray(150)),
+                );
+            }
+
+            ui.separator();
+            let (count, bytes) = picker.checked_stats();
+            ui.horizontal(|ui| {
+                ui.label(format!("выбрано: {count} ({})", human_size(bytes)));
+                ui.add_enabled_ui(count > 0, |ui| {
+                    if ui
+                        .button("📥 Импортировать выбранные")
+                        .on_hover_text("Архивы встанут в очередь и пойдут по очереди.")
+                        .clicked()
+                    {
+                        import = true;
+                    }
+                });
+                if ui.button("Отмена").clicked() {
+                    close = true;
+                }
+                ui.label(
+                    RichText::new(
+                        "пометка «уже импортирован» — подсказка по имени файла, \
+                         отметить можно и его",
+                    )
+                    .small()
+                    .color(Color32::from_gray(130)),
+                );
+            });
+        });
+
+    if choose_dir {
+        if let Some(dir) = rfd::FileDialog::new()
+            .set_title("Папка с ZIP-архивами")
+            .pick_folder()
+        {
+            picker.dir = dir;
+            picker.rescan(&archives_dir);
+        }
+    }
+    if rescan {
+        picker.rescan(&archives_dir);
+    }
+    if import {
+        let paths = picker.checked_paths();
+        app.zip_dir = Some(picker.dir.clone());
+        if !paths.is_empty() {
+            app.start_imports(paths);
+        }
+        close = true;
+    }
+    if close || !open {
+        app.zip_picker = None;
+    } else {
+        app.zip_picker = Some(picker);
     }
 }
