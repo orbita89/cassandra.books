@@ -19,6 +19,7 @@ use anyhow::Result;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use db::{BookMetadata, Library};
 use images::ImageOptConfig;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use worker::{ImportSettings, WorkerMsg};
 
@@ -38,6 +39,13 @@ pub fn human_size(bytes: u64) -> String {
     } else {
         format!("{:.0} КБ", b / 1024.0)
     }
+}
+
+/// Короткое имя файла для интерфейса: без каталогов.
+fn display_name(path: &Path) -> String {
+    path.file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 /// Состояние импорта, которое рисует нижняя панель.
@@ -61,6 +69,24 @@ pub struct ImportState {
     pub skipped: usize,
     /// Итог: (успешно, с ошибками, секунды).
     pub finished: Option<(usize, usize, f64)>,
+    /// Имя архива, по которому получен `finished` (он уже импортирован).
+    pub finished_name: Option<String>,
+    /// Имя архива, который импортируется сейчас.
+    pub current: Option<String>,
+    /// Имена архивов, ждущих своей очереди.
+    pub queue: Vec<String>,
+    /// Номер текущего архива в пакете, с единицы.
+    pub index: usize,
+    /// Сколько всего архивов в пакете. Растёт, если добавить файлы на ходу.
+    pub files: usize,
+    /// Исходники, удалённые после успешного импорта.
+    pub deleted: Vec<String>,
+    /// Исходники, оставленные из-за ошибок отдельных книг.
+    pub kept: Vec<String>,
+    /// Архивы, которые не удалось импортировать вовсе (фатальная ошибка).
+    pub failed_files: Vec<String>,
+    /// Итог по всему пакету: (книги, ошибки, секунды).
+    pub batch: (usize, usize, f64),
 }
 
 impl ImportState {
@@ -108,6 +134,8 @@ pub struct App {
     pub cache: (usize, u64),
     /// Состояние импорта.
     pub import: ImportState,
+    /// ZIP-архивы, ждущие импорта. Обрабатываются строго по одному.
+    pub import_queue: VecDeque<PathBuf>,
     /// Ошибка, которую надо показать в окне.
     pub error: Option<String>,
     /// Короткое сообщение об успехе.
@@ -142,11 +170,18 @@ impl App {
             details_open: false,
             cache: (0, 0),
             import: ImportState::default(),
+            import_queue: VecDeque::new(),
             error: None,
             toast: None,
             rx,
             tx,
-            settings: ImportSettings::default(),
+            // В GUI автоудаление исходников включено: пользователь просил
+            // освобождать место после импорта. Галочка рядом с кнопкой
+            // импорта это выключает.
+            settings: ImportSettings {
+                delete_zip: true,
+                ..ImportSettings::default()
+            },
         };
         app.refresh_search()?;
         app.refresh_cache_usage();
@@ -234,17 +269,47 @@ impl App {
         self.refresh_cache_usage();
     }
 
-    /// Запустить импорт выбранного ZIP-архива.
-    pub fn start_import(&mut self, zip: PathBuf) {
+    /// Поставить ZIP-архивы в очередь на импорт.
+    ///
+    /// Архивы обрабатываются строго по одному: пока идёт текущий, новые
+    /// просто ждут. Если импорт не запущен, первый стартует сразу. Вызывать
+    /// можно и во время импорта — тогда файлы добавятся в конец очереди.
+    pub fn start_imports(&mut self, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
+        self.import_queue.extend(paths);
+        if self.import.running {
+            self.import.queue = self.import_queue.iter().map(|p| display_name(p)).collect();
+            self.import.files = self.import.index + self.import_queue.len();
+            return;
+        }
         self.import = ImportState {
-            running: true,
-            status: "распаковка...".to_string(),
+            queue: self.import_queue.iter().map(|p| display_name(p)).collect(),
+            files: self.import_queue.len(),
             ..Default::default()
         };
         self.error = None;
         self.toast = None;
+        self.start_next_import();
+    }
+
+    /// Запустить следующий архив из очереди. `false` — очередь пуста.
+    fn start_next_import(&mut self) -> bool {
+        let Some(zip) = self.import_queue.pop_front() else {
+            return false;
+        };
+        self.import.index += 1;
+        self.import.current = Some(display_name(&zip));
+        self.import.queue = self.import_queue.iter().map(|p| display_name(p)).collect();
+        self.import.running = true;
+        self.import.done = 0;
+        self.import.total = 0;
+        self.import.last_batch = None;
+        self.import.status = "распаковка...".to_string();
         let data_dir = self.library.data_dir.clone();
         worker::spawn_import(zip, data_dir, self.settings.clone(), self.tx.clone());
+        true
     }
 
     /// Забрать всё, что прислал фоновый поток, и обновить состояние.
@@ -255,8 +320,6 @@ impl App {
                     self.import.running = true;
                     self.import.total = total;
                     self.import.done = 0;
-                    self.import.errors.clear();
-                    self.import.finished = None;
                     self.import.status = format!("{zip}: {total} книг");
                 }
                 WorkerMsg::Progress {
@@ -271,7 +334,14 @@ impl App {
                     if let Some(err) = error {
                         // Держим только последние 50 ошибок, чтобы не расти бесконечно.
                         if self.import.errors.len() < 50 {
-                            self.import.errors.push(err);
+                            // Ошибки копятся по всему пакету, поэтому называем файл.
+                            let prefix = self
+                                .import
+                                .current
+                                .as_deref()
+                                .map(|name| format!("{name}: "))
+                                .unwrap_or_default();
+                            self.import.errors.push(format!("{prefix}{err}"));
                         }
                     }
                 }
@@ -290,11 +360,25 @@ impl App {
                     skipped,
                     defects,
                     seconds,
+                    deleted,
                 } => {
                     self.import.running = false;
                     self.import.skipped = skipped;
-                    self.import.finished = Some((books, failed, seconds));
                     self.import.defects = defects;
+                    self.import.finished = Some((books, failed, seconds));
+                    self.import.finished_name = self.import.current.clone();
+                    self.import.batch.0 += books;
+                    self.import.batch.1 += failed;
+                    self.import.batch.2 += seconds;
+                    if let Some(name) = self.import.current.take() {
+                        if deleted {
+                            self.import.deleted.push(name);
+                        } else if self.settings.delete_zip {
+                            // Автоудаление включено, но файл остался: значит,
+                            // были ошибки книг. Так и скажем в панели.
+                            self.import.kept.push(name);
+                        }
+                    }
                     let mut tail = String::new();
                     if skipped > 0 {
                         tail.push_str(&format!(", нерусских отброшено: {skipped}"));
@@ -302,16 +386,33 @@ impl App {
                     if defects > 0 {
                         tail.push_str(&format!(", битых ссылок в исходниках: {defects}"));
                     }
+                    if deleted {
+                        tail.push_str(", исходный ZIP удалён");
+                    }
                     self.import.status =
                         format!("готово: {books} книг за {seconds:.0} с (ошибок: {failed}{tail})");
-                    // Новые книги должны сразу находиться поиском.
-                    let _ = self.library.reload_metadata();
-                    let _ = self.refresh_search();
-                    self.refresh_cache_usage();
+                    // Следующий архив — без перезагрузки библиотеки: она
+                    // перечитывается один раз, когда очередь опустеет.
+                    if !self.start_next_import() {
+                        // Новые книги должны сразу находиться поиском.
+                        let _ = self.library.reload_metadata();
+                        let _ = self.refresh_search();
+                        self.refresh_cache_usage();
+                    }
                 }
                 WorkerMsg::Error(err) => {
                     self.import.running = false;
+                    self.import.status = format!("ошибка импорта: {err}");
+                    if let Some(name) = self.import.current.take() {
+                        self.import.failed_files.push(name);
+                    }
                     self.error = Some(err);
+                    // Один битый архив не должен останавливать очередь.
+                    if !self.start_next_import() {
+                        let _ = self.library.reload_metadata();
+                        let _ = self.refresh_search();
+                        self.refresh_cache_usage();
+                    }
                 }
             }
         }
@@ -443,7 +544,9 @@ fn main() -> eframe::Result<()> {
             "\n",
             "Использование:\n",
             "  library_gui [data_dir]                    окно (data_dir по умолчанию `data`)\n",
-            "  library_gui --import <zip> [data_dir]     импорт без окна\n",
+            "  library_gui --import <zip>… [data_dir] [--delete]\n",
+            "                                            импорт без окна; архивов\n",
+            "                                            можно несколько — по очереди\n",
             "  library_gui --search <запрос> [data_dir] [--author X] [--genre Y]\n",
             "                                            поиск без окна\n",
             "  library_gui --convert <fb2> <epub>         конвертация FB2 → EPUB 3.3\n",
@@ -459,25 +562,58 @@ fn main() -> eframe::Result<()> {
             "  cache/          распакованные для чтения книги (чистится)\n",
             "  index/          индекс Tantivy для поиска\n",
             "  metadata/       метаданные книг, по файлу на входной ZIP\n",
+            "  imports/        отчёты об импорте, по файлу на входной ZIP\n",
         ));
         std::process::exit(0);
     }
 
-    // Служебный режим без окна: `library_gui --import <zip> [data_dir]`.
+    // Служебный режим без окна:
+    // `library_gui --import <zip>… [data_dir] [--delete]`.
     // Нужен, чтобы проверять пайплайн без дисплея и гонять пакетные импорты.
+    // Архивов можно указать сколько угодно — они импортируются по очереди.
     if args.first().map(String::as_str) == Some("--import") {
-        let zip = match args.get(1) {
-            Some(p) => PathBuf::from(p),
-            None => {
-                eprintln!("использование: library_gui --import <zip> [data_dir]");
-                std::process::exit(2);
+        let mut zips: Vec<PathBuf> = Vec::new();
+        let mut data_dir = PathBuf::from("data");
+        let mut delete = false;
+        for arg in &args[1..] {
+            if arg == "--delete" {
+                delete = true;
+                continue;
             }
-        };
-        let data_dir = args
-            .get(2)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("data"));
-        std::process::exit(run_headless_import(zip, data_dir));
+            let path = PathBuf::from(arg);
+            // Всё, что не похоже на архив, — каталог данных: так работает
+            // и прежняя форма `--import <zip> data`.
+            if path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("zip"))
+            {
+                zips.push(path);
+            } else {
+                data_dir = path;
+            }
+        }
+        if zips.is_empty() {
+            eprintln!("использование: library_gui --import <zip>… [data_dir] [--delete]");
+            std::process::exit(2);
+        }
+        // Импортируем по очереди в одном процессе: так между архивами
+        // остаётся тёплый кэш индекса, а отчёты не перемешиваются.
+        let mut code = 0;
+        for (i, zip) in zips.iter().enumerate() {
+            if zips.len() > 1 {
+                emit(format!(
+                    "=== архив {}/{}: {} ===",
+                    i + 1,
+                    zips.len(),
+                    zip.display()
+                ));
+            }
+            let result = run_headless_import(zip, &data_dir, delete);
+            if result != 0 {
+                code = result;
+            }
+        }
+        std::process::exit(code);
     }
 
     // Служебный режим без окна:
@@ -821,14 +957,18 @@ fn run_bench(zip: PathBuf, out_dir: PathBuf) -> i32 {
     0
 }
 
-fn run_headless_import(zip: PathBuf, data_dir: PathBuf) -> i32 {
+fn run_headless_import(zip: &Path, data_dir: &Path, delete: bool) -> i32 {
     emit(format!(
         "импорт {} → {}",
         zip.display(),
         data_dir.join("archives").display()
     ));
     let (tx, rx) = unbounded();
-    worker::spawn_import(zip, data_dir, ImportSettings::default(), tx);
+    let settings = ImportSettings {
+        delete_zip: delete,
+        ..ImportSettings::default()
+    };
+    worker::spawn_import(zip.to_path_buf(), data_dir.to_path_buf(), settings, tx);
 
     while let Ok(msg) = rx.recv() {
         match msg {
@@ -858,11 +998,13 @@ fn run_headless_import(zip: PathBuf, data_dir: PathBuf) -> i32 {
                 skipped,
                 defects,
                 seconds,
+                deleted,
             } => {
                 emit(format!(
                     "[готово] {books} книг за {seconds:.1} с, ошибок: {failed}, \
                      нерусских отброшено: {skipped}, \
-                     битых ссылок в исходниках: {defects}"
+                     битых ссылок в исходниках: {defects}{}",
+                    if deleted { ", исходный ZIP удалён" } else { "" }
                 ));
                 return if failed == 0 { 0 } else { 1 };
             }
@@ -1128,6 +1270,116 @@ mod tests {
         assert!(
             all.contains("на странице"),
             "в кадре нет выбора размера страницы: {all}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Очередь ZIP: архивы запускаются по одному, и следующий стартует
+    /// только после того, как предыдущий закончился — успешно или с ошибкой.
+    #[test]
+    fn import_queue_runs_archives_one_by_one() -> Result<()> {
+        let dir = std::env::temp_dir().join("library_gui_test_import_queue");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut app = App::new(dir.clone())?;
+
+        // Оба архива не существуют: воркер сразу падает, но очередь обязана
+        // доехать до конца, а не остановиться на первом.
+        app.start_imports(vec![
+            dir.join("нет-такого-1.zip"),
+            dir.join("нет-такого-2.zip"),
+        ]);
+        assert!(app.import.running, "первый архив должен был стартовать");
+        assert_eq!(app.import.files, 2, "в пакете два архива");
+        assert_eq!(app.import.index, 1, "сейчас первый архив");
+        assert_eq!(app.import.queue, vec!["нет-такого-2.zip".to_string()]);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !(!app.import.running && app.import.index == 2) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "очередь не доехала до второго архива за 10 с"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            app.pump_worker();
+        }
+        assert_eq!(
+            app.import.failed_files,
+            vec![
+                "нет-такого-1.zip".to_string(),
+                "нет-такого-2.zip".to_string()
+            ],
+            "оба архива должны быть отмечены как несостоявшиеся"
+        );
+        assert!(app.import.queue.is_empty(), "очередь должна опустеть");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Панель импорта показывает место архива в очереди и саму очередь.
+    #[test]
+    fn ui_renders_import_queue() -> Result<()> {
+        let dir = std::env::temp_dir().join("library_gui_test_ui_queue");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut app = App::new(dir.clone())?;
+
+        app.import.running = true;
+        app.import.files = 2;
+        app.import.index = 1;
+        app.import.total = 10;
+        app.import.done = 4;
+        app.import.status = "книга — автор".to_string();
+        app.import.queue = vec!["второй.zip".to_string()];
+
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let frame = |app: &mut App| {
+            let mut out = ctx.run_ui(input.clone(), |ui| {
+                ui::draw(app, ui);
+            });
+            out.textures_delta.clear();
+            out
+        };
+        // Первый кадр панель получает высоту по содержимому — как и выше.
+        frame(&mut app);
+        let output = frame(&mut app);
+
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            collect_texts(&clipped.shape, &mut texts);
+        }
+        let all = texts.join(" | ");
+        assert!(
+            all.contains("файл 1 из 2"),
+            "в кадре нет места архива в очереди: {all}"
+        );
+        assert!(
+            all.contains("в очереди (1): второй.zip"),
+            "в кадре нет очереди архивов: {all}"
+        );
+
+        // Оставленный из-за ошибок исходник тоже должен быть виден.
+        app.import.queue.clear();
+        app.import.running = false;
+        app.import.kept = vec!["первый.zip".to_string()];
+        frame(&mut app);
+        let output = frame(&mut app);
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            collect_texts(&clipped.shape, &mut texts);
+        }
+        let all = texts.join(" | ");
+        assert!(
+            all.contains("оставлено из-за ошибок") && all.contains("первый.zip"),
+            "в кадре нет сведений об оставленном исходнике: {all}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

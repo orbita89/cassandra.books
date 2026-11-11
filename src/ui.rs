@@ -94,17 +94,35 @@ fn top_panel(app: &mut App, ui: &mut egui::Ui) {
 
             ui.separator();
             let importing = app.import.running;
-            ui.add_enabled_ui(!importing, |ui| {
-                if ui.button("📥 Импортировать ZIP…").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("ZIP-архив с FB2", &["zip"])
-                        .set_title("Выберите ZIP-архив с FB2")
-                        .pick_file()
-                    {
-                        app.start_import(path);
-                    }
+            // Кнопка не блокируется во время импорта: выбранные архивы встанут
+            // в очередь и пойдут следующими.
+            if ui
+                .button("📥 Импортировать ZIP…")
+                .on_hover_text(
+                    "Можно выбрать сразу несколько архивов — они импортируются по очереди.",
+                )
+                .clicked()
+            {
+                if let Some(paths) = rfd::FileDialog::new()
+                    .add_filter("ZIP-архив с FB2", &["zip"])
+                    .set_title("Выберите ZIP-архивы с FB2 (можно несколько)")
+                    .pick_files()
+                {
+                    app.start_imports(paths);
                 }
-            });
+            }
+            let mut delete_zip = app.settings.delete_zip;
+            if ui
+                .checkbox(&mut delete_zip, "удалять ZIP")
+                .on_hover_text(
+                    "Удалять исходный архив после успешного импорта.\n\
+                     Если хоть одна книга не собралась, архив остаётся — \
+                     иначе переимпорт был бы невозможен.",
+                )
+                .changed()
+            {
+                app.settings.delete_zip = delete_zip;
+            }
             if importing {
                 ui.spinner();
             }
@@ -661,7 +679,10 @@ fn bottom_panel(app: &mut App, ui: &mut egui::Ui) {
     let show = app.import.running
         || app.import.finished.is_some()
         || app.import.last_batch.is_some()
-        || !app.import.errors.is_empty();
+        || !app.import.errors.is_empty()
+        || !app.import.deleted.is_empty()
+        || !app.import.kept.is_empty()
+        || !app.import.failed_files.is_empty();
     if !show {
         return;
     }
@@ -675,6 +696,18 @@ fn bottom_panel(app: &mut App, ui: &mut egui::Ui) {
                 ui.spinner();
             } else {
                 ui.label("✅");
+            }
+            // «файл 2 из 5» — чтобы при пакетном импорте было видно место
+            // каждого архива, а не только его собственное имя.
+            if app.import.files > 1 {
+                ui.label(
+                    RichText::new(format!(
+                        "файл {} из {}",
+                        app.import.index.min(app.import.files),
+                        app.import.files
+                    ))
+                    .color(Color32::from_gray(150)),
+                );
             }
             ui.label(&app.import.status);
 
@@ -701,6 +734,19 @@ fn bottom_panel(app: &mut App, ui: &mut egui::Ui) {
             });
         });
 
+        // Что ещё ждёт своей очереди.
+        if !app.import.queue.is_empty() {
+            ui.label(
+                RichText::new(format!(
+                    "в очереди ({}): {}",
+                    app.import.queue.len(),
+                    app.import.queue.join(", ")
+                ))
+                .small()
+                .color(Color32::from_gray(150)),
+            );
+        }
+
         if app.import.running {
             ui.add(
                 egui::ProgressBar::new(app.import.fraction())
@@ -711,6 +757,59 @@ fn bottom_panel(app: &mut App, ui: &mut egui::Ui) {
                 RichText::new(format!("{} из {} книг", app.import.done, app.import.total))
                     .small()
                     .color(Color32::from_gray(150)),
+            );
+        } else if let (Some((books, failed, seconds)), Some(name)) =
+            (app.import.finished, app.import.finished_name.as_deref())
+        {
+            ui.label(
+                RichText::new(format!(
+                    "последний архив: {name} — {books} книг за {seconds:.0} с, ошибок {failed}"
+                ))
+                .small()
+                .color(Color32::from_gray(160)),
+            );
+        }
+
+        // Что стало с исходными ZIP: удалены автоудалением или оставлены.
+        let mut summary: Vec<String> = Vec::new();
+        if !app.import.deleted.is_empty() {
+            summary.push(format!(
+                "исходных ZIP удалено: {}",
+                app.import.deleted.len()
+            ));
+        }
+        if !app.import.kept.is_empty() {
+            summary.push(format!(
+                "оставлено из-за ошибок: {} ({})",
+                app.import.kept.len(),
+                app.import.kept.join(", ")
+            ));
+        }
+        if !app.import.failed_files.is_empty() {
+            summary.push(format!(
+                "не импортированы: {} ({})",
+                app.import.failed_files.len(),
+                app.import.failed_files.join(", ")
+            ));
+        }
+        if !summary.is_empty() {
+            ui.label(
+                RichText::new(summary.join(" · "))
+                    .small()
+                    .color(Color32::from_rgb(200, 190, 150)),
+            );
+        }
+
+        // Когда архивов было несколько, интересен ещё и общий итог пакета.
+        if !app.import.running && app.import.files > 1 && app.import.finished.is_some() {
+            let (books, failed, seconds) = app.import.batch;
+            ui.label(
+                RichText::new(format!(
+                    "пакет из {} архивов: {books} книг за {seconds:.0} с, ошибок {failed}",
+                    app.import.files
+                ))
+                .small()
+                .color(Color32::from_gray(180)),
             );
         }
 

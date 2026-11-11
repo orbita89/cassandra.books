@@ -326,6 +326,7 @@ fn same_file(a: &Path, b: &Path) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn write_import_log(
     data_dir: &Path,
+    batch_name: &str,
     zip: &Path,
     cfg: &ImageOptConfig,
     cores: usize,
@@ -412,8 +413,20 @@ fn write_import_log(
         }
     }
 
+    // Отчёт по каждому импорту отдельно: в очереди архивов `import.log`
+    // достаётся последнему, и прошлые отчёты терялись бы. Файл `import.log`
+    // остаётся на месте и по-прежнему описывает последний импорт.
+    let dir = data_dir.join("imports");
+    if let Err(err) = fs::create_dir_all(&dir) {
+        eprintln!("[!] не удалось создать {}: {err}", dir.display());
+    }
+    let per_import = dir.join(format!("{batch_name}.log"));
+    match fs::write(&per_import, &s) {
+        Ok(()) => eprintln!("[лог] отчёт об импорте: {}", per_import.display()),
+        Err(err) => eprintln!("[!] не удалось записать {}: {err}", per_import.display()),
+    }
     let path = data_dir.join("import.log");
-    match fs::write(&path, s) {
+    match fs::write(&path, &s) {
         Ok(()) => eprintln!("[лог] отчёт об импорте: {}", path.display()),
         Err(err) => eprintln!("[!] не удалось записать {}: {err}", path.display()),
     }
@@ -471,6 +484,8 @@ pub enum WorkerMsg {
         /// Сколько битых ссылок на картинки нашли в исходниках (дефект FB2, не наш).
         defects: usize,
         seconds: f64,
+        /// Удалён ли исходный ZIP после импорта.
+        deleted: bool,
     },
     /// Фатальная ошибка импорта — показывается в окне.
     Error(String),
@@ -564,6 +579,12 @@ pub struct ImportSettings {
     pub jobs: usize,
     /// Аргумент `-c` для `arx create`: `zstd=19`, `none`, `lzma=9`…
     pub arx_compression: String,
+    /// Удалить исходный ZIP после успешного импорта.
+    ///
+    /// Именно **после успешного**: если хоть одна книга не собралась, архив
+    /// остаётся, иначе переимпорт стал бы невозможен. По умолчанию выключено —
+    /// это разрушительное действие, и включать его должен пользователь.
+    pub delete_zip: bool,
 }
 
 impl Default for ImportSettings {
@@ -572,6 +593,7 @@ impl Default for ImportSettings {
             image: ImageOptConfig::from_env(),
             jobs: 0,
             arx_compression: ARX_COMPRESSION.to_string(),
+            delete_zip: false,
         }
     }
 }
@@ -684,6 +706,9 @@ fn run_import(
         }
         format!("{lo}-{hi}")
     };
+    // Повторный импорт того же диапазона не должен затирать уже собранный
+    // `.arx`: иначе старые записи метаданных начнут указывать на чужой архив.
+    let batch_name = unique_batch_name(&archives_dir, &covers_dir, &batch_name);
     // Ссылка для потоков: сам `batch_name` нужен ещё в конце импорта.
     let batch_ref = &batch_name;
 
@@ -896,25 +921,66 @@ fn run_import(
         .wall
         .store(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     print_profile(threads, &settings.image);
+    let failed_books = failed.load(Ordering::Relaxed);
     write_import_log(
         data_dir,
+        &batch_name,
         zip,
         &settings.image,
         threads,
         all_books.len(),
-        failed.load(Ordering::Relaxed),
+        failed_books,
         skipped.load(Ordering::Relaxed),
         &foreign,
         &duplicates,
     );
+    // Автоудаление исходного ZIP. Только после успешного импорта: если хоть
+    // одна книга не собралась, архив остаётся — иначе переимпорт невозможен.
+    let deleted = if settings.delete_zip && failed_books == 0 {
+        match fs::remove_file(zip) {
+            Ok(()) => {
+                eprintln!("[✓] исходный ZIP удалён: {}", zip.display());
+                true
+            }
+            Err(err) => {
+                eprintln!("[!] не удалось удалить {}: {err}", zip.display());
+                false
+            }
+        }
+    } else {
+        false
+    };
     let _ = tx.send(WorkerMsg::Finished {
         books: all_books.len(),
-        failed: failed.load(Ordering::Relaxed),
+        failed: failed_books,
         skipped: skipped.load(Ordering::Relaxed),
         defects: defects.load(Ordering::Relaxed),
         seconds: started.elapsed().as_secs_f64(),
+        deleted,
     });
     Ok(())
+}
+
+/// Свободное имя партии: базовое `821884-824013`, при занятости — с `-2`, `-3`…
+///
+/// Один входной ZIP — одна партия, один `.arx` и одна папка обложек. Если
+/// такой архив уже есть (повторный импорт того же диапазона id), второй
+/// импорт обязан получить своё имя: иначе он затрёт первый, а записи
+/// метаданных останутся указывать на подменённый архив.
+fn unique_batch_name(archives_dir: &Path, covers_dir: &Path, base: &str) -> String {
+    let taken = |name: &str| {
+        archives_dir.join(format!("{name}.arx")).exists() || covers_dir.join(name).exists()
+    };
+    if !taken(base) {
+        return base.to_string();
+    }
+    for n in 2usize.. {
+        let candidate = format!("{base}-{n}");
+        if !taken(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("свободное имя партии не нашлось")
 }
 
 /// Обработать одну книгу: конвертация → 100 % WebP → проверка.
@@ -1813,5 +1879,47 @@ mod summary_tests {
             crate::db::Library::cover_rel_path("1-2", 7, "png")
         );
         assert_eq!(fs::read(covers.join(&written)).unwrap(), bytes);
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    /// Имя партии не должно затирать уже собранный архив.
+    ///
+    /// Повторный импорт того же диапазона id (например, того же ZIP после
+    /// ошибок) обязан получить своё имя: иначе второй прогон перезапишет
+    /// `.arx`, а метаданные первого продолжат на него ссылаться.
+    #[test]
+    fn repeated_batch_gets_a_free_name() {
+        let dir = std::env::temp_dir().join("library_gui_test_batch_name");
+        let _ = fs::remove_dir_all(&dir);
+        let archives = dir.join("archives");
+        let covers = dir.join("covers");
+        fs::create_dir_all(&archives).unwrap();
+        fs::create_dir_all(&covers).unwrap();
+
+        // Свободное имя отдаётся как есть.
+        assert_eq!(
+            unique_batch_name(&archives, &covers, "1-9"),
+            "1-9".to_string()
+        );
+
+        // Занятый архив — новое имя.
+        fs::write(archives.join("1-9.arx"), b"x").unwrap();
+        assert_eq!(
+            unique_batch_name(&archives, &covers, "1-9"),
+            "1-9-2".to_string()
+        );
+
+        // Папка обложек тоже считается занятой: архив мог быть уже упакован.
+        fs::create_dir_all(covers.join("1-9-2")).unwrap();
+        assert_eq!(
+            unique_batch_name(&archives, &covers, "1-9"),
+            "1-9-3".to_string()
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
