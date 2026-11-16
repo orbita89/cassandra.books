@@ -24,6 +24,7 @@
 use anyhow::{bail, Context, Result};
 use quick_xml::events::Event;
 use quick_xml::Reader;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
@@ -66,6 +67,27 @@ impl Element {
         })
     }
 
+    /// Все потомки с таким именем — на любом уровне вложенности.
+    pub fn descendants<'a>(&'a self, name: &'a str) -> Vec<&'a Element> {
+        let mut out = Vec::new();
+        let mut stack: Vec<&Element> = self.children.iter().filter_map(|n| match n {
+            Node::Element(e) => Some(e),
+            Node::Text(_) => None,
+        }).collect();
+        while let Some(el) = stack.pop() {
+            if el.name == name {
+                out.push(el);
+            }
+            // Детей кладём в обратном порядке: тогда обход идёт в порядке
+            // документа, как `kids`.
+            stack.extend(el.children.iter().rev().filter_map(|n| match n {
+                Node::Element(e) => Some(e),
+                Node::Text(_) => None,
+            }));
+        }
+        out
+    }
+
     pub fn first(&self, name: &str) -> Option<&Element> {
         self.children.iter().find_map(|n| match n {
             Node::Element(e) if e.name == name => Some(e),
@@ -94,22 +116,71 @@ impl Element {
     }
 }
 
-/// Разобрать XML в дерево. Ошибка — а не молча пустой результат.
-fn parse_xml(xml: &str) -> Result<Element> {
+/// Предел на число записанных дефектов разбора: в мусорном XML их бывают
+/// тысячи, а в отчёте нужен сам факт, а не полный список.
+const MAX_DEFECTS: usize = 8;
+
+/// Эти элементы закрываются только точным именем: ошибка в регистре у них —
+/// не мелочь, а потеря всего остатка книги (содержимое уезжает за пределы
+/// `<body>`, и `Book::parse` его уже не видит).
+const STRICT_END: [&str; 2] = ["body", "FictionBook"];
+
+/// С этих слов начинается дефект, после которого разбор оборвался и текст
+/// мог потеряться. По нему `convert_bytes` решает, пробовать ли ещё раз.
+const XML_CUT: &str = "XML оборвался";
+
+/// Записать дефект разбора, не раздувая отчёт.
+fn note_defect(defects: &mut Vec<String>, message: String) {
+    if defects.len() < MAX_DEFECTS {
+        defects.push(message);
+    } else if defects.len() == MAX_DEFECTS {
+        defects.push("… остальные дефекты XML не перечисляем".to_string());
+    }
+}
+
+/// Разобрать XML в дерево.
+///
+/// Разбор намеренно терпимый. FB2 — далеко не всегда корректный XML:
+/// незакрытые `<p>`, лишние `</title>`, HTML-таблицы с непарными `<td>`,
+/// атрибуты вида `<p style color=red>`. Строгий разбор терял такие книги
+/// целиком (2 400 из 2 634 в `data/failed/`), хотя дефект обычно локальный,
+/// а текст в файле целый. Поэтому:
+///
+/// * имена закрывающих тегов сверяем сами: несовпадающий тег закрывает всё
+///   до совпадающего, лишний — игнорируется;
+/// * битый атрибут пропускаем, остальные читаем;
+/// * на невосстановимой ошибке возвращаем то, что успели собрать, — книга
+///   лучше, чем ничего, а дефект попадает в отчёт (`ConvertReport::xml_defects`).
+fn parse_xml(xml: &str, defects: &mut Vec<String>) -> Result<Element> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(false);
+    // Сверяем закрывающие теги сами: ронять книгу на `expected </b>, but </p>
+    // was found` нельзя, а quick-xml именно это и делает при проверке.
+    reader.config_mut().check_end_names = false;
+    // Лишний `</strong>` без открытого тега и `&` без `;` — такие же обычные
+    // дефекты этих FB2, и на них разбор тоже обрывался.
+    reader.config_mut().allow_unmatched_ends = true;
+    reader.config_mut().allow_dangling_amp = true;
 
     let mut stack: Vec<Element> = Vec::new();
     let mut root: Option<Element> = None;
 
     loop {
         match reader.read_event() {
-            Err(e) => bail!("не удалось разобрать XML на позиции {}: {e}", reader.buffer_position()),
+            Err(e) => {
+                // После такой ошибки позиция разбора неизвестна — читать дальше
+                // нельзя. Отдаём то, что успели собрать.
+                note_defect(
+                    defects,
+                    format!("{XML_CUT} на позиции {}: {e}", reader.buffer_position()),
+                );
+                break;
+            }
             Ok(Event::Eof) => break,
             Ok(Event::Start(e)) => {
                 let el = Element {
                     name: e.name().as_ref().to_string(),
-                    attrs: read_attrs(&e)?,
+                    attrs: read_attrs(&e, defects),
                     children: Vec::new(),
                 };
                 stack.push(el);
@@ -117,22 +188,70 @@ fn parse_xml(xml: &str) -> Result<Element> {
             Ok(Event::Empty(e)) => {
                 let el = Element {
                     name: e.name().as_ref().to_string(),
-                    attrs: read_attrs(&e)?,
+                    attrs: read_attrs(&e, defects),
                     children: Vec::new(),
                 };
                 attach(&mut stack, &mut root, Node::Element(el))?;
             }
-            Ok(Event::End(_)) => {
-                let Some(el) = stack.pop() else {
-                    bail!("лишний закрывающий тег на позиции {}", reader.buffer_position());
-                };
-                attach(&mut stack, &mut root, Node::Element(el))?;
+            Ok(Event::End(e)) => {
+                let name = e.name().as_ref().to_string();
+                // Ищем совпадающий открытый элемент: всё, что выше него,
+                // закрывается неявно (`</title>` поверх незакрытого `<center>` —
+                // обычное дело в этих файлах).
+                //
+                // Регистр прощаем только «мелким» элементам: `<p>…</P>`
+                // закрыть надо, а вот `</BODY>` не должен закрывать `<body>`
+                // через полкниги — после этого весь остаток книги оказывался
+                // вне тела и пропадал (книга 3782 из `data/failed/`: внутри
+                // FB2 лежит HTML-документ со своим `</BODY>`).
+                let found = stack
+                    .iter()
+                    .rposition(|el| el.name == name)
+                    .or_else(|| {
+                        if STRICT_END.iter().any(|s| s.eq_ignore_ascii_case(&name)) {
+                            return None;
+                        }
+                        stack.iter().rposition(|el| el.name.eq_ignore_ascii_case(&name))
+                    });
+                match found {
+                    Some(pos) => {
+                        if stack.len() > pos + 1 {
+                            // Неявно закрытые элементы — тоже дефект: именно
+                            // из-за них строгий разбор терял книгу.
+                            let inner: Vec<String> = stack[pos + 1..]
+                                .iter()
+                                .map(|el| format!("<{}>", el.name))
+                                .collect();
+                            note_defect(
+                                defects,
+                                format!("не закрыты теги {} перед </{name}>", inner.join(", ")),
+                            );
+                        }
+                        while stack.len() > pos + 1 {
+                            let el = stack.pop().expect("стек не пуст");
+                            attach(&mut stack, &mut root, Node::Element(el))?;
+                        }
+                        let el = stack.pop().expect("совпадение найдено");
+                        attach(&mut stack, &mut root, Node::Element(el))?;
+                    }
+                    None => note_defect(defects, format!("лишний закрывающий тег </{name}>")),
+                }
             }
             Ok(Event::Text(t)) => {
-                let decoded = quick_xml::escape::unescape(&t)
-                    .with_context(|| format!("битая сущность на позиции {}", reader.buffer_position()))?;
-                if !decoded.is_empty() {
-                    attach(&mut stack, &mut root, Node::Text(decoded.into_owned()))?;
+                // `&` без `;` пропущен настройкой выше, но `unescape` на таком
+                // тексте падает — тогда берём текст как есть.
+                let (text, broken) = match quick_xml::escape::unescape(&t) {
+                    Ok(decoded) => (decoded.into_owned(), None),
+                    Err(err) => (t.to_string(), Some(err)),
+                };
+                if let Some(err) = broken {
+                    note_defect(
+                        defects,
+                        format!("битая сущность на позиции {}: {err}", reader.buffer_position()),
+                    );
+                }
+                if !text.is_empty() {
+                    attach(&mut stack, &mut root, Node::Text(text))?;
                 }
             }
             Ok(Event::CData(c)) => {
@@ -165,21 +284,184 @@ fn parse_xml(xml: &str) -> Result<Element> {
         }
     }
 
+    // Незакрытые элементы в конце файла закрываем как есть: незакрытый `<p>`
+    // не повод терять книгу. Если корень уже собран, а дальше остался мусор
+    // после `</FictionBook>`, — выбрасываем его.
+    while let Some(el) = stack.pop() {
+        let name = el.name.clone();
+        if attach(&mut stack, &mut root, Node::Element(el)).is_err() {
+            note_defect(defects, format!("элемент <{name}> вне корня проигнорирован"));
+            break;
+        }
+    }
+
     root.context("в FB2 не нашлось корневого элемента")
 }
 
-fn read_attrs(e: &quick_xml::events::BytesStart<'_>) -> Result<Vec<(String, String)>> {
+/// Прочитать атрибуты тега, пропуская битые.
+///
+/// `<p style color=red>` — типичный дефект этих FB2: ключ атрибута без `=`.
+/// Раньше на нём терялась вся книга, хотя остальные атрибуты целы.
+/// Итератор quick-xml после ошибки продолжает с места восстановления, поэтому
+/// испорченный атрибут стоит ровно одного пропущенного атрибута.
+/// Конец тега, если с `start` (позиции `<`) начинается настоящий тег.
+///
+/// Отличает разметку от угловых кавычек в тексте: `<C'est le savant...>` или
+/// `<совершенно непостижимое...>` тегом не являются, а `<p id="x">` — является.
+/// `>` внутри значения атрибута (`<p title="a > b">`) концом тега не считается.
+fn tag_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut i = start + 1;
+    // Имя тега (у закрывающего — после `/`).
+    if bytes.get(i) == Some(&b'/') {
+        i += 1;
+    }
+    match bytes.get(i) {
+        Some(c) if c.is_ascii_alphabetic() || matches!(c, b'_' | b':') => i += 1,
+        _ => return None,
+    }
+    while matches!(bytes.get(i), Some(c) if c.is_ascii_alphanumeric() || matches!(c, b'_' | b':' | b'.' | b'-')) {
+        i += 1;
+    }
+    loop {
+        while matches!(bytes.get(i), Some(c) if c.is_ascii_whitespace()) {
+            i += 1;
+        }
+        match bytes.get(i) {
+            Some(b'>') => return Some(i),
+            // Конец тега: `<p/>`, `<empty-line />`.
+            Some(b'/') if bytes.get(i + 1) == Some(&b'>') => return Some(i + 1),
+            _ => {}
+        }
+        // Дальше обязан идти атрибут вида `имя="значение"`.
+        match bytes.get(i) {
+            Some(c) if c.is_ascii_alphabetic() || matches!(c, b'_' | b':') => i += 1,
+            _ => return None,
+        }
+        while matches!(bytes.get(i), Some(c) if c.is_ascii_alphanumeric() || matches!(c, b'_' | b':' | b'.' | b'-')) {
+            i += 1;
+        }
+        while matches!(bytes.get(i), Some(c) if c.is_ascii_whitespace()) {
+            i += 1;
+        }
+        if bytes.get(i) != Some(&b'=') {
+            return None;
+        }
+        i += 1;
+        while matches!(bytes.get(i), Some(c) if c.is_ascii_whitespace()) {
+            i += 1;
+        }
+        match bytes.get(i) {
+            Some(&q @ (b'"' | b'\'')) => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != q {
+                    i += 1;
+                }
+                i += 1;
+            }
+            // Значение без кавычек — до пробела или `>`.
+            Some(_) => {
+                while matches!(bytes.get(i), Some(c) if !c.is_ascii_whitespace() && *c != b'>') {
+                    i += 1;
+                }
+            }
+            None => return None,
+        }
+    }
+}
+
+/// Заменить на `&lt;` те `<`, которые не могут начинать тег.
+///
+/// «5 < 10» или `<!` из распознанного скана — не разметка, но для XML это
+/// ошибка, и разбор на ней обрывался (книга доезжала до архива наполовину).
+/// Трогаем только `<`, за которым не может начинаться ни тег, ни комментарий,
+/// ни CDATA, ни инструкция: имя тега в FB2 всегда латинское, поэтому
+/// `<у меня жена` — это текст, а не тег. Корректный XML эта замена не меняет.
+fn sanitize_markup(xml: &str) -> Cow<'_, str> {
+    let bytes = xml.as_bytes();
+    let mut out: Option<String> = None;
+    let mut from = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        let rest = &bytes[i + 1..];
+        // Внутри комментария и CDATA `<` — обычный текст: пропускаем блок целиком,
+        // чтобы не портить содержимое.
+        let skip = if rest.starts_with(b"!--") {
+            rest.windows(3).position(|w| w == b"-->")
+        } else if rest.starts_with(b"![CDATA[") {
+            rest.windows(3).position(|w| w == b"]]>")
+        } else {
+            None
+        };
+        if let Some(p) = skip {
+            i += 4 + p;
+            continue;
+        }
+        let starts_tag = match rest.first() {
+            // Обычный тег: `<p>`, `</p>`, `<l:href>`, `<a_b>`. Только латиница
+            // и только если дальше правда тег: `<C'est le savant...>` — это
+            // текст в угловых кавычках, а не тег с атрибутом.
+            Some(c) if c.is_ascii_alphabetic() || matches!(c, b'/' | b'_' | b':') => {
+                tag_end(bytes, i).is_some()
+            }
+            // `<` + `!` бывает только началом комментария, CDATA или DOCTYPE.
+            Some(b'!') => {
+                rest.starts_with(b"!--")
+                    || rest.starts_with(b"![CDATA[")
+                    || rest.get(1).is_some_and(u8::is_ascii_alphabetic)
+            }
+            // `<` + `?` — начало инструкции, например `<?xml`.
+            Some(b'?') => rest.get(1).is_some_and(u8::is_ascii_alphabetic),
+            _ => false,
+        };
+        if starts_tag {
+            i += 1;
+            continue;
+        }
+        let buf = out.get_or_insert_with(|| String::with_capacity(xml.len() + 16));
+        buf.push_str(&xml[from..i]);
+        buf.push_str("&lt;");
+        from = i + 1;
+        i += 1;
+    }
+    match out {
+        Some(mut s) => {
+            s.push_str(&xml[from..]);
+            Cow::Owned(s)
+        }
+        None => Cow::Borrowed(xml),
+    }
+}
+
+fn read_attrs(
+    e: &quick_xml::events::BytesStart<'_>,
+    defects: &mut Vec<String>,
+) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for a in e.attributes() {
-        let a = a.context("битый атрибут в FB2")?;
+        let a = match a {
+            Ok(a) => a,
+            Err(err) => {
+                note_defect(
+                    defects,
+                    format!(
+                        "битый атрибут в <{}>: {err}",
+                        e.name().as_ref()
+                    ),
+                );
+                continue;
+            }
+        };
         let key = a.key.as_ref().to_string();
-        let value = a
-            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
-            .context("битое значение атрибута")?
-            .into_owned();
-        out.push((key, value));
+        match a.normalized_value(quick_xml::XmlVersion::Implicit1_0) {
+            Ok(value) => out.push((key, value.into_owned())),
+            Err(err) => note_defect(defects, format!("битое значение атрибута `{key}`: {err}")),
+        }
     }
-    Ok(out)
+    out
 }
 
 fn attach(stack: &mut [Element], root: &mut Option<Element>, node: Node) -> Result<()> {
@@ -317,19 +599,38 @@ impl Book {
             }
         }
 
-        // Тела: первое без `name` — основное, тела `notes`/`footnotes` — примечания.
-        for body in root.kids("body") {
+        // Тела: `notes`/`footnotes` — примечания, тела без `name` — основной
+        // текст. Основных тел бывает несколько: в FB2 так оформляют тома и
+        // части, а встречается и просто разрезанный на куски файл (9 тел в
+        // одной книге из `data/failed/`). Раньше бралось только первое тело,
+        // и книга приезжала с одним томом из девяти — терялось 98 % текста.
+        // Обычно тела лежат прямо в `<FictionBook>`. Но книги от
+        // OOo-ExportToFB21 пишут закрывающий тег экранированным
+        // (`&lt;/description&gt;`), описание не закрывается, и `<body>`
+        // оказывается вложен в него — такая книга считалась пустой, хотя в ней
+        // сотни тысяч слов (7 книг из `data/failed/`). Поэтому если тел на
+        // верхнем уровне нет, ищем их по всему дереву.
+        let mut bodies: Vec<&Element> = root.kids("body").collect();
+        if bodies.is_empty() {
+            bodies = root.descendants("body");
+        }
+        let mut main: Option<Element> = None;
+        for body in bodies {
             let name = body.attr("name").unwrap_or("").trim().to_ascii_lowercase();
             if name == "notes" || name == "footnotes" || name == "comments" {
                 collect_notes(body, &mut book.notes);
-            } else if book.body.is_none() && name.is_empty() {
-                book.body = Some(body.clone());
+                continue;
             }
-            // остальные тела (например, второе оглавление) просто отбрасываем
+            if !name.is_empty() {
+                // Именованные тела (например, второе оглавление) не берём.
+                continue;
+            }
+            match &mut main {
+                None => main = Some(body.clone()),
+                Some(acc) => acc.children.extend(body.children.iter().cloned()),
+            }
         }
-        if book.body.is_none() {
-            book.body = root.kids("body").next().cloned();
-        }
+        book.body = main.or_else(|| root.kids("body").next().cloned());
 
         for b in root.kids("binary") {
             let Some(id) = b.attr("id") else { continue };
@@ -563,10 +864,27 @@ fn is_block(name: &str) -> bool {
     )
 }
 
+/// Текст, лежащий прямо в контейнере, а не в `<p>`.
+///
+/// В кривых FB2 абзацы разделены `<empty-line/>`, а сам текст лежит между
+/// ними — прямо в `<td>` или в `<section>`. Раньше такой текст молча
+/// пропадал, и книга приезжала почти пустой.
+fn render_stray_text(t: &str, out: &mut String) {
+    let t = t.trim();
+    if t.is_empty() {
+        return;
+    }
+    out.push_str("<p>");
+    out.push_str(&escape_text(t));
+    out.push_str("</p>\n");
+}
+
 fn render_blocks(children: &[Node], out: &mut String, ctx: &mut Ctx, depth: usize) {
     for child in children {
-        let Node::Element(e) = child else { continue };
-        render_block(e, out, ctx, depth);
+        match child {
+            Node::Element(e) => render_block(e, out, ctx, depth),
+            Node::Text(t) => render_stray_text(t, out),
+        }
     }
 }
 
@@ -720,7 +1038,14 @@ fn render_section(
 
     let mut n = 0usize;
     for child in &sec.children {
-        let Node::Element(e) = child else { continue };
+        let e = match child {
+            Node::Element(e) => e,
+            // Текст прямо в секции — тоже абзац, а не мусор.
+            Node::Text(t) => {
+                render_stray_text(t, out);
+                continue;
+            }
+        };
         if e.name == "section" {
             n += 1;
             render_section(e, out, ctx, depth + 1, &format!("{path}-{n}"));
@@ -981,6 +1306,15 @@ pub struct ConvertReport {
     pub missing_images: Vec<String>,
     /// Внутренние ссылки на якоря, которых в FB2 нет.
     pub missing_anchors: Vec<String>,
+    /// Дефекты XML, которые разбор пережил: несовпадающие теги, битые
+    /// атрибуты, оборванный документ. Раньше на них книга терялась целиком.
+    pub xml_defects: Vec<String>,
+    /// Сколько слов в тексте книги.
+    ///
+    /// По этому счёту статья, заметка или миниатюра отличается от книги
+    /// (см. [`crate::db::SHORT_WORDS`]): размер файла для этого не годится —
+    /// стихи на 79 слов весят 1.2 МБ, если это ноты или скан.
+    pub words: u64,
 }
 
 /// Старшая половина таблицы Windows-1251 (коды 0x80..0xBF).
@@ -1190,7 +1524,17 @@ pub fn convert(fb2: &Path, out: &Path) -> Result<ConvertReport> {
 /// читался дважды — один раз ради статистики письма, второй раз здесь.
 pub fn convert_bytes(bytes: &[u8], fb2: &Path, out: &Path) -> Result<ConvertReport> {
     let xml = decode_fb2(bytes);
-    let root = parse_xml(&xml).with_context(|| format!("{}: не разобран FB2", fb2.display()))?;
+    let mut xml_defects = Vec::new();
+    // Голые `<` в тексте («5 < 10», «<у меня жена») — не разметка, но для XML
+    // это ошибка: разбор либо обрывался, либо съедал хвост как «атрибуты».
+    // Чистим всегда; если менять нечего, строку не копируем.
+    let cleaned = sanitize_markup(&xml);
+    let repaired = matches!(cleaned, Cow::Owned(_));
+    let root = parse_xml(&cleaned, &mut xml_defects)
+        .with_context(|| format!("{}: не разобран FB2", fb2.display()))?;
+    if repaired {
+        xml_defects.insert(0, "в тексте были голые `<` — заменены на `&lt;`".to_string());
+    }
     if root.name != "FictionBook" {
         bail!("{}: корневой элемент `{}`, а не `FictionBook`", fb2.display(), root.name);
     }
@@ -1272,6 +1616,14 @@ pub fn convert_bytes(bytes: &[u8], fb2: &Path, out: &Path) -> Result<ConvertRepo
     if raw_parts.is_empty() {
         bail!("{}: в FB2 нет текста для конвертации", fb2.display());
     }
+
+    // Сколько слов в книге — по тому же дереву, из которого собираются части.
+    // `render_plain` снимает разметку, так что счёт идёт по чистому тексту.
+    let words: u64 = raw_parts
+        .iter()
+        .flatten()
+        .map(|el| render_plain(el).split_whitespace().count() as u64)
+        .sum();
 
     let mut nav: Vec<NavNode> = Vec::new();
     let mut files: Vec<(String, String)> = Vec::new();
@@ -1445,6 +1797,8 @@ pub fn convert_bytes(bytes: &[u8], fb2: &Path, out: &Path) -> Result<ConvertRepo
         missing_notes: std::mem::take(&mut ctx.missing_notes),
         missing_images: std::mem::take(&mut ctx.missing_images),
         missing_anchors: std::mem::take(&mut ctx.missing_anchors),
+        xml_defects,
+        words,
     })
 }
 
@@ -1986,9 +2340,205 @@ mod tests {
     }
 
     #[test]
+    fn xml_survives_mismatched_end_tags() {
+        // `</title>` поверх незакрытого `<center>` — так выглядит половина
+        // lib.rus.ec; раньше на этом книга терялась целиком.
+        let doc = r##"<FictionBook><body><section><title><p>Имя<center> </title><p>текст</p></section></body></FictionBook>"##;
+        let mut defects = Vec::new();
+        let root = parse_xml(doc, &mut defects).expect("разбирается");
+        let section = root.first("body").unwrap().first("section").unwrap();
+        let text = section.text();
+        assert!(text.contains("Имя"), "потерян текст до дефекта: {text:?}");
+        assert!(text.contains("текст"), "потерян текст после дефекта: {text:?}");
+        assert!(!defects.is_empty(), "о дефекте надо сказать");
+    }
+
+    #[test]
+    fn xml_skips_broken_attribute_and_keeps_the_rest() {
+        // `<p style color=red>` — ключ атрибута без `=`. До этого терялась
+        // вся книга, хотя испорчен ровно один атрибут.
+        let doc = r##"<FictionBook><body><section id="s1"><p style color="red" class="c">текст</p></section></body></FictionBook>"##;
+        let mut defects = Vec::new();
+        let root = parse_xml(doc, &mut defects).expect("разбирается");
+        let p = root.first("body").unwrap().first("section").unwrap().first("p").unwrap();
+        assert_eq!(p.text(), "текст");
+        assert_eq!(p.attr("class"), Some("c"), "целые атрибуты должны остаться");
+        assert!(!defects.is_empty(), "о дефекте надо сказать");
+    }
+
+    fn test_ctx() -> Ctx {
+        Ctx {
+            images: HashMap::new(),
+            note_anchor: HashMap::new(),
+            refs: Vec::new(),
+            anchors: HashSet::new(),
+            missing_notes: Vec::new(),
+            missing_anchors: Vec::new(),
+            missing_images: Vec::new(),
+            part_file: "text/part0001.xhtml".into(),
+            counter: 0,
+        }
+    }
+
+    #[test]
+    fn stray_text_inside_container_is_rendered() {
+        // Так выглядит книга 107050 из `data/failed/`: абзацы разделены
+        // `<empty-line/>`, а текст лежит между ними прямо в `<td>`.
+        let cell = el(
+            "td",
+            &[],
+            vec![
+                Node::Element(el("empty-line", &[], vec![])),
+                Node::Text("Первый абзац. ".into()),
+                Node::Element(el("empty-line", &[], vec![])),
+                Node::Text("Второй абзац.".into()),
+                Node::Element(el("empty-line", &[], vec![])),
+                Node::Text("   \n  ".into()),
+            ],
+        );
+        let sec = el(
+            "section",
+            &[],
+            vec![
+                Node::Text("Текст прямо в секции.".into()),
+                Node::Element(el("table", &[], vec![Node::Element(el("tr", &[], vec![Node::Element(cell)]))])),
+            ],
+        );
+        let mut out = String::new();
+        let mut ctx = test_ctx();
+        render_section(&sec, &mut out, &mut ctx, 0, "1");
+        for needle in ["Текст прямо в секции.", "Первый абзац.", "Второй абзац."] {
+            assert!(out.contains(needle), "потерян {needle:?}: {out}");
+        }
+        assert!(!out.contains("<p></p>"), "пустой абзац из пробелов: {out}");
+    }
+
+    #[test]
+    fn uppercase_end_tag_does_not_close_lowercase_body() {
+        // В книге 3782 из `data/failed/` внутри `<body>` лежит HTML-документ, и
+        // его `</BODY>` закрывал FB2-шное `<body>` — остаток книги пропадал.
+        let doc = r##"<FictionBook><body><section><p>первый</p></section></BODY><p>второй</p></body></FictionBook>"##;
+        let root = parse_xml(doc, &mut Vec::new()).expect("разбирается");
+        let book = Book::parse(&root).expect("разбирается");
+        let body = book.body.expect("тело есть");
+        let text = body.text();
+        assert!(text.contains("первый"), "{text}");
+        assert!(text.contains("второй"), "текст после </BODY> потерян: {text}");
+        // А несовпадение регистра у верхнего элемента по-прежнему закрывает.
+        let doc = r##"<FictionBook><body><section><P>абзац</P><p>хвост</p></section></body></FictionBook>"##;
+        let root = parse_xml(doc, &mut Vec::new()).expect("разбирается");
+        let book = Book::parse(&root).expect("разбирается");
+        let text = book.body.expect("тело есть").text();
+        assert!(text.contains("абзац") && text.contains("хвост"), "{text}");
+    }
+
+    #[test]
+    fn book_finds_body_nested_in_unclosed_description() {
+        // OOo-ExportToFB21 пишет `&lt;/description&gt;`, описание не
+        // закрывается, и `<body>` уезжает внутрь него.
+        let doc = r##"<FictionBook><description><title-info><book-title>Имя</book-title>
+            </title-info>&lt;/description&gt;<body><section><p>Текст книги</p></section></body>
+            </FictionBook>"##;
+        let root = parse_xml(doc, &mut Vec::new()).expect("разбирается");
+        let book = Book::parse(&root).expect("разбирается");
+        assert_eq!(book.title, "Имя", "описание должно разобраться");
+        let text = book.body.expect("тело найдено").text();
+        assert!(text.contains("Текст книги"), "{text}");
+    }
+
+    #[test]
+    fn book_merges_several_unnamed_bodies() {
+        // Многотомник и разрезанный файл: текст в нескольких `<body>` без имени.
+        let doc = r##"<FictionBook><body><section><p>том первый</p></section></body>
+            <body><section><p>том второй</p></section></body>
+            <body name="notes"><section id="n1"><p>сноска</p></section></body></FictionBook>"##;
+        let root = parse_xml(doc, &mut Vec::new()).expect("разбирается");
+        let book = Book::parse(&root).expect("разбирается");
+        let body = book.body.expect("тело есть");
+        let text = body.text();
+        assert!(text.contains("том первый"), "{text}");
+        assert!(text.contains("том второй"), "второе тело потеряно: {text}");
+        assert_eq!(book.notes.len(), 1, "примечания должны остаться отдельно");
+    }
+
+    #[test]
+    fn xml_survives_dangling_ampersand() {
+        let doc = r##"<FictionBook><body><p>Петров & Ко</p></body></FictionBook>"##;
+        let root = parse_xml(doc, &mut Vec::new()).expect("разбирается");
+        assert_eq!(root.first("body").unwrap().first("p").unwrap().text(), "Петров & Ко");
+    }
+
+    #[test]
+    fn sanitize_keeps_real_tags_and_escapes_angle_quotes() {
+        for good in [
+            "<p>", "</p>", "<p/>", "<p >", "</p >", "<empty-line />",
+            "<p id=\"x\">", "<p id='x'>", "<p id=x>", "<a l:href=\"#n1\">",
+            "<image xlink:href=\"#c.jpg\"/>", "<FictionBook xmlns=\"http://x\">",
+            "<p title=\"a > b\">", "<td colspan=\"2\">", "<v id=\"v1\">",
+        ] {
+            assert!(tag_end(good.as_bytes(), 0).is_some(), "не признан тегом: {good}");
+        }
+        for bad in [
+            "<C'est le savant de notre famille...>",
+            "<совершенно непостижимое для разума поражение жизни>",
+            "<у меня жена, возможно, вам поможет>",
+            "<p attr>",
+            "<Hello, world!>",
+            "<",
+        ] {
+            assert!(tag_end(bad.as_bytes(), 0).is_none(), "признан тегом: {bad}");
+        }
+    }
+
+    #[test]
+    fn sanitize_does_not_touch_comments_cdata_and_instructions() {
+        for good in [
+            "<a><!-- угол < тут --></a>",
+            "<a><![CDATA[ 5 < 10 ]]></a>",
+            "<?xml version=\"1.0\"?><a/>",
+            "<!DOCTYPE FictionBook>",
+        ] {
+            assert!(matches!(sanitize_markup(good), std::borrow::Cow::Borrowed(_)), "{good}");
+        }
+        // А вот `<!` из распознанного скана — уже не разметка.
+        let bad = "<p>кричит: \"ЗтаНп-@га<! тизз\"</p>";
+        assert!(matches!(sanitize_markup(bad), std::borrow::Cow::Owned(_)), "{bad}");
+    }
+
+    #[test]
+    fn sanitize_escapes_only_bare_angle_brackets() {
+        let doc = r##"<FictionBook><p>5 < 10</p></FictionBook>"##;
+        let fixed = sanitize_markup(doc);
+        assert!(fixed.contains("5 &lt; 10"), "{fixed}");
+        // Настоящие теги не тронуты.
+        assert!(fixed.contains("<FictionBook>") && fixed.contains("</p>"), "{fixed}");
+        assert!(matches!(fixed, std::borrow::Cow::Owned(_)), "должна быть замена");
+        // Корректный XML возвращается как есть, без копии.
+        let good = "<a><b/></a>";
+        assert!(matches!(sanitize_markup(good), std::borrow::Cow::Borrowed(_)));
+        assert_eq!(sanitize_markup(good), good);
+    }
+
+    #[test]
+    fn xml_ignores_stray_closing_tag() {
+        let doc = r##"<FictionBook><body></p><section><p>текст</p></section></body></FictionBook>"##;
+        let mut defects = Vec::new();
+        let root = parse_xml(doc, &mut defects).expect("разбирается");
+        assert_eq!(root.first("body").unwrap().first("section").unwrap().text(), "текст");
+        assert!(defects.iter().any(|d| d.contains("лишний")), "дефекты: {defects:?}");
+    }
+
+    #[test]
+    fn xml_closes_unclosed_elements_at_the_end() {
+        let doc = r##"<FictionBook><body><section><p>текст"##;
+        let root = parse_xml(doc, &mut Vec::new()).expect("разбирается");
+        assert_eq!(root.first("body").unwrap().first("section").unwrap().text(), "текст");
+    }
+
+    #[test]
     fn xml_parses_attributes_with_prefix() {
         let doc = r##"<FictionBook><body><section id="s1"><a l:href="#n1" type="note">1</a></section></body></FictionBook>"##;
-        let root = parse_xml(doc).expect("разбирается");
+        let root = parse_xml(doc, &mut Vec::new()).expect("разбирается");
         let a = root.first("body").unwrap().first("section").unwrap().first("a").unwrap();
         assert_eq!(a.attr("href"), Some("#n1"));
         assert_eq!(a.attr("type"), Some("note"));
@@ -1997,7 +2547,7 @@ mod tests {
     #[test]
     fn xml_joins_text_split_by_entities() {
         let doc = r##"<FictionBook><p>a&amp;b</p></FictionBook>"##;
-        let root = parse_xml(doc).expect("разбирается");
+        let root = parse_xml(doc, &mut Vec::new()).expect("разбирается");
         assert_eq!(root.first("p").unwrap().text(), "a&b");
     }
 

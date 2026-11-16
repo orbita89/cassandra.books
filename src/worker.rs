@@ -469,7 +469,18 @@ pub fn threads_for(settings: &ImportSettings) -> usize {
 /// zstd жмёт батч целиком и даёт на ~20 % меньше, чем Deflate по книгам:
 /// на 14 тестовых книгах 5.81 МБ против 7.41 МБ. Уровень 19 — колено кривой,
 /// дальше 22 почти не выигрывает, а времени тратит больше.
-pub const ARX_COMPRESSION: &str = "zstd=22";
+///
+/// Уровень 22 вдобавок стоит неприлично много памяти. Замер на живом архиве
+/// (48 МБ, 164 книги, 144 МБ распакованных): `arx create -c zstd=22` просит
+/// **9.7 ГБ** — и пик не зависит ни от размера входа, ни от числа потоков
+/// (`RAYON_NUM_THREADS`, `ZSTD_NBTHREADS` не помогают), потому что это
+/// словари zstd под окно в сотни мегабайт. Вынос пересобирает архивы в
+/// несколько потоков, так что 10-12 таких сборок разом съедали всю память с
+/// свопом, и systemd-oomd убивал процесс (в журнале — `Failed with result
+/// 'oom-kill'`). На уровне 19 тот же архив собирается за 9 с вместо 12,
+/// просит **1.4 ГБ**, а на выходе 47 990 526 байт против 47 989 964 —
+/// разница 0.001 %.
+pub const ARX_COMPRESSION: &str = "zstd=19";
 
 /// Сообщения из фонового потока в UI.
 #[derive(Debug, Clone)]
@@ -505,6 +516,17 @@ pub enum WorkerMsg {
     },
     /// Фатальная ошибка импорта — показывается в окне.
     Error(String),
+    /// Вынос дубликатов: очередной шаг.
+    DedupProgress {
+        step: crate::dedup::Step,
+        done: usize,
+        total: usize,
+        status: String,
+    },
+    /// Вынос дубликатов закончен.
+    DedupDone(Box<crate::dedup::Outcome>),
+    /// Вынос дубликатов упал целиком.
+    DedupFailed(String),
 }
 
 /// Почему книга не прошла фильтр языка.
@@ -626,6 +648,37 @@ pub fn spawn_import(
     std::thread::spawn(move || {
         if let Err(err) = run_import(&zip, &data_dir, &settings, &tx) {
             let _ = tx.send(WorkerMsg::Error(format!("{err:#}")));
+        }
+    });
+}
+
+/// Вынести дубликаты в фоне. План уже прочитан и подтверждён в окне.
+///
+/// `Sender` можно дёргать из нескольких потоков сразу, поэтому прогресс
+/// уходит в UI прямо из рабочих потоков пересборки архивов — без общего
+/// мьютекса и без очереди.
+pub fn spawn_dedup(
+    plan: crate::dedup::Plan,
+    data_dir: PathBuf,
+    jobs: usize,
+    tx: Sender<WorkerMsg>,
+) {
+    std::thread::spawn(move || {
+        let report = |progress: crate::dedup::Progress| {
+            let _ = tx.send(WorkerMsg::DedupProgress {
+                step: progress.step,
+                done: progress.done,
+                total: progress.total,
+                status: progress.status,
+            });
+        };
+        match crate::dedup::execute(&plan, &data_dir, jobs, &report) {
+            Ok(outcome) => {
+                let _ = tx.send(WorkerMsg::DedupDone(Box::new(outcome)));
+            }
+            Err(err) => {
+                let _ = tx.send(WorkerMsg::DedupFailed(format!("{err:#}")));
+            }
         }
     });
 }
@@ -1143,12 +1196,22 @@ fn process_one_inner(
     for anchor in &report.missing_anchors {
         warnings.push(format!("{name}: внутренняя ссылка на отсутствующий якорь `{anchor}`"));
     }
+    // Дефекты XML, которые разбор пережил: раньше на них книга терялась целиком.
+    for defect in &report.xml_defects {
+        warnings.push(format!("{name}: {defect}"));
+    }
 
     // ---- оптимизация картинок: WebP/AVIF + уменьшение ----------------------
     let t_phase = Instant::now();
     let stats = images::optimize_epub(&converted, &optimized, cfg)
         .with_context(|| format!("оптимизация картинок не удалась для {name}"))?;
     tally(&PROFILE.images, t_phase);
+    // Нечитаемые картинки не роняют книгу: на их место встала заглушка.
+    for (was, _) in &stats.replaced_names {
+        warnings.push(format!(
+            "{name}: картинка `{was}` не читается — заменена пустышкой"
+        ));
+    }
 
     // Один проход по готовому EPUB вместо четырёх: `count_images`,
     // `find_dangling_refs`, `save_cover` и `read_chapters` открывали один и
@@ -1249,6 +1312,10 @@ fn process_one_inner(
         archive: String::new(),
         internal_path: name,
         size,
+        // Счёт слов: по нему библиотека потом отделяет статьи от книг.
+        words: Some(report.words),
+        // Отметку «прятать» поставит библиотека при загрузке метаданных.
+        hidden: false,
     }), warnings))
 }
 

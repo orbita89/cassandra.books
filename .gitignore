@@ -1,2 +1,9 @@
 /target
 /data
+/archives
+/cache
+/covers
+/imports
+/dedup_out
+/dublicate
+/__pycache__

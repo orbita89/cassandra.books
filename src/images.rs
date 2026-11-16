@@ -656,8 +656,15 @@ pub struct ImageOptStats {
     pub webp: usize,
     /// Сколько картинок стало AVIF.
     pub avif: usize,
-    /// Сколько картинок не удалось декодировать (остаются как есть).
+    /// Сколько картинок не удалось декодировать.
     pub failed: usize,
+    /// Сколько из них заменено прозрачной заглушкой WebP, чтобы книга всё же
+    /// доехала до архива (иначе её отбраковывает проверка «100 % WebP/AVIF»).
+    pub replaced: usize,
+    /// Имена заменённых картинок: `(как было, как стало)`. Первое — для
+    /// отчёта, второе — чтобы узнать заменённую обложку в OPF (там к этому
+    /// моменту href уже переписан на новое имя).
+    pub replaced_names: Vec<(String, String)>,
     /// Суммарный размер текстовых файлов (XHTML/CSS/OPF/NCX) до минификации.
     pub text_before: u64,
     /// Он же после минификации.
@@ -1887,8 +1894,9 @@ pub fn optimize_single(
     name: &str,
     data: &[u8],
     cfg: &ImageOptConfig,
+    is_cover: bool,
 ) -> Result<Option<OptimizedImage>> {
-    Ok(encode_image(name, data, cfg, false)?.map(|e| OptimizedImage {
+    Ok(encode_image(name, data, cfg, is_cover)?.map(|e| OptimizedImage {
         data: e.data,
         ext: e.format.ext(),
         mime: e.format.mime(),
@@ -2437,6 +2445,40 @@ fn encode_all(
         .collect()
 }
 
+/// Прозрачный пиксель 1×1 в WebP — заглушка вместо нечитаемой картинки.
+///
+/// Выбросить запись нельзя: `<img>` в тексте повиснет, а epubcheck ругается на
+/// битую ссылку. Заглушка держит ссылку живой и формально соблюдает
+/// «100 % WebP/AVIF».
+fn placeholder_webp() -> Result<Vec<u8>> {
+    const PARAMS: WebpParams = WebpParams {
+        quality: 100.0,
+        method: 4,
+        lossless: true,
+        near_lossless: 0,
+        sns_strength: 0,
+        filter_strength: 0,
+        pass: 1,
+        autofilter: false,
+    };
+    encode_webp(&[0, 0, 0, 0], 1, 1, &PARAMS)
+}
+
+/// Новое имя для записи, которую перекодировали в WebP: расширение меняется,
+/// занятые имена обходим так же, как в обычной ветке.
+fn placeholder_name(name: &str, used_names: &mut HashSet<String>) -> String {
+    used_names.remove(name);
+    let stem = strip_ext(name);
+    let mut final_name = format!("{stem}.webp");
+    let mut n = 1;
+    while used_names.contains(&final_name) {
+        final_name = format!("{stem}.{n}.webp");
+        n += 1;
+    }
+    used_names.insert(final_name.clone());
+    final_name
+}
+
 /// Шаг «картинки»: перекодировать, переименовать, поправить ссылки и OPF.
 ///
 /// Это самая тяжёлая часть (libwebp method 6 + AVIF), но картинки одной книги
@@ -2506,10 +2548,29 @@ fn process_images(input: &Path, cfg: &ImageOptConfig) -> Result<ImageStage> {
         stats.bytes_before += data.len() as u64;
 
         let Some(enc) = result? else {
-            // Картинка не декодировалась — оставляем байты как есть.
+            // Картинка не декодировалась: битый PNG, WMF под именем JPEG и т.п.
+            // Раньше байты оставляли как есть — и книга целиком отбраковывалась
+            // проверкой «100 % WebP/AVIF» (217 книг в `data/failed/`). Теперь на
+            // её место встаёт прозрачный пиксель: ссылка в XHTML остаётся живой,
+            // книга доезжает до архива, а замена видна в отчёте.
             stats.failed += 1;
-            stats.bytes_after += data.len() as u64;
-            out_entries.push((name, data));
+            stats.replaced += 1;
+            let final_name = placeholder_name(&name, &mut used_names);
+            stats.replaced_names.push((
+                basename(&name).to_string(),
+                basename(&final_name).to_string(),
+            ));
+            if final_name != name {
+                renames.push((
+                    basename(&name).to_string(),
+                    basename(&final_name).to_string(),
+                    "image/webp".to_string(),
+                ));
+            }
+            let placeholder = placeholder_webp()?;
+            stats.bytes_after += placeholder.len() as u64;
+            stats.webp += 1;
+            out_entries.push((final_name, placeholder));
             continue;
         };
 
@@ -2613,7 +2674,7 @@ fn process_images(input: &Path, cfg: &ImageOptConfig) -> Result<ImageStage> {
         }
         // В OPF, кроме href, надо поправить `media-type` — точечно, по `<item>`.
         if Some(name.as_str()) == opf_name.as_deref() {
-            let fixed = rewrite_opf_items(&text, &renames);
+            let fixed = rewrite_opf_items(&text, &renames, &stats.replaced_names);
             if fixed != text {
                 text = fixed;
                 changed = true;
@@ -2941,7 +3002,11 @@ pub fn cover_bytes(epub: &Path) -> Result<Option<(String, Vec<u8>)>> {
 ///
 /// Заодно чинит `application/octet-stream` у картинок, которые уже `.webp`/`.avif`
 /// (например, у обложки без расширения в исходнике).
-fn rewrite_opf_items(text: &str, renames: &[(String, String, String)]) -> String {
+fn rewrite_opf_items(
+    text: &str,
+    renames: &[(String, String, String)],
+    replaced: &[(String, String)],
+) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     loop {
@@ -2963,13 +3028,17 @@ fn rewrite_opf_items(text: &str, renames: &[(String, String, String)]) -> String
             return out;
         };
         let (item, tail) = from_item.split_at(end + 1);
-        out.push_str(&rewrite_item(item, renames));
+        out.push_str(&rewrite_item(item, renames, replaced));
         rest = tail;
     }
 }
 
 /// Переписать один тег `<item .../>`.
-fn rewrite_item(item: &str, renames: &[(String, String, String)]) -> String {
+fn rewrite_item(
+    item: &str,
+    renames: &[(String, String, String)],
+    replaced: &[(String, String)],
+) -> String {
     let Some(href) = item_attr(item, "href") else {
         return item.to_string();
     };
@@ -3010,7 +3079,35 @@ fn rewrite_item(item: &str, renames: &[(String, String, String)]) -> String {
             }
         }
     }
+    // Обложку, которую не удалось прочитать, мы заменили заглушкой: объявлять
+    // её обложкой нельзя, иначе в библиотеке у книги будет пустой пиксель
+    // вместо обложки (и он ещё перевесит настоящую обложку при выборе хранителя).
+    if replaced.iter().any(|(_, now)| now == base) {
+        out = strip_cover_property(&out);
+    }
     out
+}
+
+/// Убрать `cover-image` из `properties` у `<item>`.
+///
+/// Если других значений в `properties` нет, атрибут убирается целиком.
+fn strip_cover_property(item: &str) -> String {
+    let Some(p) = item.find("properties=\"") else {
+        return item.to_string();
+    };
+    let start = p + "properties=\"".len();
+    let Some(e) = item[start..].find('"') else {
+        return item.to_string();
+    };
+    let kept: Vec<&str> = item[start..start + e]
+        .split_whitespace()
+        .filter(|v| *v != "cover-image")
+        .collect();
+    if kept.is_empty() {
+        format!("{}{}", item[..p].trim_end(), &item[start + e + 1..])
+    } else {
+        format!("{}{}{}", &item[..start], kept.join(" "), &item[start + e..])
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3437,6 +3534,29 @@ mod tests {
     }
 
     #[test]
+    fn opf_loses_cover_image_for_replaced_cover() {
+        // Обложку не удалось прочитать — на её месте заглушка, объявлять её
+        // обложкой нельзя: иначе в библиотеке будет пустой пиксель.
+        let item = r#"<item id="i0" href="images/cover.webp" media-type="image/webp" properties="cover-image"/>"#;
+        let renames = vec![(
+            "cover.jpg".to_string(),
+            "cover.webp".to_string(),
+            "image/webp".to_string(),
+        )];
+        let replaced = vec![("cover.jpg".to_string(), "cover.webp".to_string())];
+        let out = rewrite_item(item, &renames, &replaced);
+        assert!(!out.contains("cover-image"), "{out}");
+        assert!(out.contains("href=\"images/cover.webp\""), "{out}");
+    }
+
+    #[test]
+    fn opf_keeps_cover_image_when_nothing_was_replaced() {
+        let item = r#"<item id="i0" href="images/cover.webp" media-type="image/webp" properties="cover-image"/>"#;
+        let out = rewrite_item(item, &[], &[]);
+        assert!(out.contains("cover-image"), "{out}");
+    }
+
+    #[test]
     fn opf_rewrite_updates_href_and_media_type() {
         let renames = vec![(
             "cover.jpg".to_string(),
@@ -3444,7 +3564,7 @@ mod tests {
             "image/avif".to_string(),
         )];
         let opf = r##"<manifest><item id="cover" href="images/cover.jpg" media-type="image/jpeg"/><item id="css" href="style.css" media-type="text/css"/></manifest><spine><itemref idref="cover"/></spine>"##;
-        let out = rewrite_opf_items(opf, &renames);
+        let out = rewrite_opf_items(opf, &renames, &[]);
         assert!(out.contains(r#"href="images/cover.avif""#), "{out}");
         assert!(out.contains(r#"media-type="image/avif""#), "{out}");
         assert!(out.contains(r#"href="style.css" media-type="text/css""#), "{out}");
@@ -3455,14 +3575,14 @@ mod tests {
     #[test]
     fn opf_octet_stream_becomes_webp() {
         let opf = r#"<item id="x" href="i_1.webp" media-type="application/octet-stream"/>"#;
-        let out = rewrite_opf_items(opf, &[]);
+        let out = rewrite_opf_items(opf, &[], &[]);
         assert!(out.contains(r#"media-type="image/webp""#), "{out}");
     }
 
     #[test]
     fn opf_leaves_css_media_type_alone() {
         let opf = r#"<item id="css" href="style.css" media-type="text/css"/>"#;
-        assert_eq!(rewrite_opf_items(opf, &[]), opf);
+        assert_eq!(rewrite_opf_items(opf, &[], &[]), opf);
     }
 
     #[test]

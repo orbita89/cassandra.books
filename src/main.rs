@@ -8,7 +8,9 @@
 //!
 //! Все данные лежат в `data/` (путь можно передать первым аргументом).
 
+mod author_suggest;
 mod db;
+mod dedup;
 mod fb2epub;
 mod genres;
 mod images;
@@ -272,6 +274,45 @@ fn id_range(file_name: &str) -> Option<(u64, u64)> {
     })
 }
 
+/// Состояние выноса дубликатов.
+///
+/// Сам план читается заранее (кнопкой), а тут живёт то, что видно в окне:
+/// подтверждение, прогресс и итог.
+#[derive(Default)]
+pub struct DedupState {
+    /// Идёт вынос — интерфейс показывает прогресс и не даёт запустить второй.
+    pub running: bool,
+    /// На каком шаге: обложки, архивы, метаданные, индекс.
+    pub step: String,
+    /// Сколько единиц шага сделано и всего.
+    pub done: usize,
+    pub total: usize,
+    /// Что происходит прямо сейчас.
+    pub status: String,
+    /// Отчёт после завершения.
+    pub finished: Option<String>,
+    /// Открытое окно подтверждения вместе с прочитанным планом.
+    pub dialog: Option<DedupDialog>,
+}
+
+/// Окно подтверждения: что именно уедет в `dublicate/`.
+pub struct DedupDialog {
+    pub plan: dedup::Plan,
+    pub books: usize,
+    pub archives: usize,
+    pub bytes: u64,
+}
+
+impl DedupState {
+    /// Доля выполненного шага — для полоски прогресса.
+    pub fn fraction(&self) -> f32 {
+        if self.total == 0 {
+            return 0.0;
+        }
+        (self.done as f32 / self.total as f32).clamp(0.0, 1.0)
+    }
+}
+
 /// Всё состояние приложения.
 pub struct App {
     /// Открытая библиотека (индекс + метаданные).
@@ -290,10 +331,28 @@ pub struct App {
     pub matched: usize,
     /// Сколько книг прошло фильтры — по этому числу считается листание.
     pub filtered: usize,
+    /// Показанная выдача собрана резервным запросом с одной опечаткой, то есть
+    /// совпадения приблизительные. См. [`db::SearchOutcome::approximate`].
+    pub approximate: bool,
     /// Фильтр по автору — точное совпадение; `None` значит «все».
     pub filter_author: Option<String>,
+    /// Текст в поле автодополнения автора. Подсказки берутся из
+    /// [`App::author_dictionary`], поэтому ввод сюда не трогает поиск.
+    pub author_query: String,
+    /// Полный словарь авторов индекса: подсказки по началу любого слова.
+    ///
+    /// Собирается из индекса один раз при старте и после перезагрузки
+    /// библиотеки (импорт, вынос дубликатов), а не в `refresh_search`: иначе
+    /// каждый запрос заново читал бы словарь термов Tantivy.
+    pub author_dictionary: author_suggest::AuthorDictionary,
     /// Фильтр по жанру — точное совпадение; `None` значит «все».
     pub filter_genre: Option<String>,
+    /// Показывать статьи и заметки: по умолчанию они спрятаны, см.
+    /// [`db::SHORT_WORDS`].
+    pub show_short: bool,
+    /// Какие книги показывать по обложке: всё, только с обложкой или только
+    /// без обложки. См. [`db::CoverFilter`].
+    pub cover_filter: db::CoverFilter,
     /// Авторы, встречающиеся в текущей выдаче (для выпадающего списка).
     pub authors: Vec<(String, usize)>,
     /// Жанры, встречающиеся в текущей выдаче.
@@ -322,6 +381,8 @@ pub struct App {
     pub tx: Sender<WorkerMsg>,
     /// Настройки импорта.
     pub settings: ImportSettings,
+    /// Вынос дубликатов.
+    pub dedup: DedupState,
 }
 
 impl App {
@@ -338,8 +399,13 @@ impl App {
             page_size: db::DEFAULT_SEARCH_LIMIT,
             matched: 0,
             filtered: 0,
+            approximate: false,
             filter_author: None,
+            author_query: String::new(),
+            author_dictionary: author_suggest::AuthorDictionary::empty(),
             filter_genre: None,
+            show_short: false,
+            cover_filter: db::CoverFilter::All,
             authors: Vec::new(),
             genres: Vec::new(),
             selected: None,
@@ -360,15 +426,58 @@ impl App {
                 delete_zip: true,
                 ..ImportSettings::default()
             },
+            dedup: DedupState::default(),
         };
+        // Словарь авторов — до первого кадра: в интерфейсе он уже нужен, а
+        // поиск от него не зависит, поэтому ошибку сборки показываем окном,
+        // но приложение не останавливаем.
+        app.rebuild_author_dictionary();
         app.refresh_search()?;
         app.refresh_cache_usage();
         Ok(app)
     }
 
+    /// Пересобрать словарь авторов из индекса.
+    ///
+    /// Словарь зависит только от индекса, а не от текущей выдачи, поэтому
+    /// вызывается при старте, после [`App::reload_library`] и после импорта —
+    /// но не в [`App::refresh_search`].
+    pub fn rebuild_author_dictionary(&mut self) {
+        match self.library.author_dictionary() {
+            Ok(authors) => {
+                self.author_dictionary = author_suggest::AuthorDictionary::new(authors);
+            }
+            Err(err) => {
+                self.error = Some(format!("не удалось собрать словарь авторов: {err:#}"));
+            }
+        }
+    }
+
     /// Сколько страниц в текущей выдаче (минимум одна).
     pub fn pages(&self) -> usize {
         self.filtered.div_ceil(self.page_size.max(1)).max(1)
+    }
+
+    /// Открыть библиотеку заново после выноса дубликатов.
+    ///
+    /// Индекс к этому моменту уже пересобран фоновым потоком, поэтому здесь
+    /// достаточно подменить `Library` целиком: так в памяти оказываются и
+    /// новые метаданные, и новый читатель Tantivy.
+    pub fn reload_library(&mut self) {
+        match Library::open(&self.library.data_dir) {
+            Ok(library) => {
+                self.library = library;
+                self.selected = None;
+                self.details_open = false;
+                // Индекс пересобран — словарь авторов тоже должен быть новым.
+                self.rebuild_author_dictionary();
+                if let Err(err) = self.refresh_search() {
+                    self.error = Some(format!("{err:#}"));
+                }
+                self.refresh_cache_usage();
+            }
+            Err(err) => self.error = Some(format!("не удалось перечитать библиотеку: {err:#}")),
+        }
     }
 
     /// Пересчитать выдачу по текущему запросу, фильтрам и номеру страницы.
@@ -385,11 +494,17 @@ impl App {
                 &self.query,
                 self.filter_author.as_deref(),
                 self.filter_genre.as_deref(),
+                self.show_short,
+                self.cover_filter,
                 self.page * self.page_size,
                 self.page_size,
             )?;
             self.matched = outcome.matched;
             self.filtered = outcome.filtered;
+            // Признак пересчитывается на каждом проходе: если страница
+            // «съехала» и поиск повторится, пометка обязана соответствовать
+            // последней выдаче.
+            self.approximate = outcome.approximate;
             let pages = self.pages();
             // Страница могла исчезнуть — например, после смены фильтра книг
             // стало меньше. Тогда показываем последнюю, а не пустоту.
@@ -411,9 +526,10 @@ impl App {
         Ok(())
     }
 
-    /// Сбросить фильтры по автору и жанру.
+    /// Сбросить фильтры по автору и жанру и очистить поле автодополнения.
     pub fn clear_filters(&mut self) {
         self.filter_author = None;
+        self.author_query.clear();
         self.filter_genre = None;
     }
 
@@ -470,6 +586,79 @@ impl App {
         self.error = None;
         self.toast = None;
         self.start_next_import();
+    }
+
+    /// Открыть окно подтверждения выноса дубликатов.
+    ///
+    /// Сам план не считаем: его составляет `dedup.py` (там вся логика про
+    /// авторов, тома и обложки), а кнопка только показывает, что уедет, и
+    /// спрашивает разрешения.
+    pub fn open_dedup_dialog(&mut self) {
+        let Some(path) = dedup::find_plan(&self.library.data_dir) else {
+            self.error = Some(format!(
+                "не найден план выноса. Сначала постройте его:\n\
+                 python3 dedup.py --phash\n\
+                 (ожидается {} или {})",
+                self.library
+                    .data_dir
+                    .parent()
+                    .unwrap_or(Path::new("."))
+                    .join(dedup::REPORT_DIR)
+                    .join(dedup::PLAN_NAME)
+                    .display(),
+                self.library
+                    .data_dir
+                    .join(dedup::REPORT_DIR)
+                    .join(dedup::PLAN_NAME)
+                    .display(),
+            ));
+            return;
+        };
+        match dedup::Plan::load(&path) {
+            Ok(plan) => {
+                let (books, archives, bytes) = plan.summary();
+                self.error = None;
+                self.dedup.dialog = Some(DedupDialog {
+                    plan,
+                    books,
+                    archives,
+                    bytes,
+                });
+            }
+            Err(err) => self.error = Some(format!("{err:#}")),
+        }
+    }
+
+    /// Запустить вынос дубликатов из подтверждённого плана.
+    pub fn start_dedup(&mut self) {
+        let Some(dialog) = self.dedup.dialog.take() else {
+            return;
+        };
+        if self.import.running || self.dedup.running {
+            self.dedup.dialog = Some(dialog);
+            return;
+        }
+        self.error = None;
+        self.toast = None;
+        self.dedup.running = true;
+        self.dedup.step = "подготовка".into();
+        self.dedup.done = 0;
+        self.dedup.total = dialog.plan.items.len();
+        self.dedup.status = format!("к выносу: {} книг", dialog.books);
+        self.dedup.finished = None;
+        // Потолки у импорта и у выноса разные: там 48 потоков гоняют rav1e,
+        // здесь каждый поток держит распакованный архив на диске.
+        let jobs = if self.settings.jobs > 0 {
+            self.settings.jobs
+        } else {
+            dedup::default_jobs()
+        };
+        worker::spawn_dedup(
+            dialog.plan,
+            self.library.data_dir.clone(),
+            jobs,
+            self.tx.clone(),
+        );
     }
 
     /// Открыть окно выбора архивов: список `.zip` в каталоге с галочками.
@@ -586,8 +775,10 @@ impl App {
                     // Следующий архив — без перезагрузки библиотеки: она
                     // перечитывается один раз, когда очередь опустеет.
                     if !self.start_next_import() {
-                        // Новые книги должны сразу находиться поиском.
+                        // Новые книги должны сразу находиться поиском, а их
+                        // авторы — в подсказках: словарь зависит от индекса.
                         let _ = self.library.reload_metadata();
+                        self.rebuild_author_dictionary();
                         let _ = self.refresh_search();
                         self.refresh_cache_usage();
                     }
@@ -602,9 +793,47 @@ impl App {
                     // Один битый архив не должен останавливать очередь.
                     if !self.start_next_import() {
                         let _ = self.library.reload_metadata();
+                        self.rebuild_author_dictionary();
                         let _ = self.refresh_search();
                         self.refresh_cache_usage();
                     }
+                }
+                WorkerMsg::DedupProgress {
+                    step,
+                    done,
+                    total,
+                    status,
+                } => {
+                    self.dedup.running = true;
+                    self.dedup.step = step.title().to_string();
+                    self.dedup.done = done;
+                    self.dedup.total = total;
+                    self.dedup.status = status;
+                }
+                WorkerMsg::DedupDone(outcome) => {
+                    self.dedup.running = false;
+                    self.dedup.step = "готово".into();
+                    self.dedup.done = 1;
+                    self.dedup.total = 1;
+                    let report = outcome.report();
+                    self.dedup.status = report.lines().next().unwrap_or_default().to_string();
+                    self.dedup.finished = Some(report.clone());
+                    self.toast = Some(format!("дубликаты вынесены в {}", dedup::DUBLICATE_DIR));
+                    // Библиотека перечитывается целиком: и метаданные, и индекс
+                    // уже пересобраны фоновым потоком.
+                    self.reload_library();
+                }
+                WorkerMsg::DedupFailed(err) => {
+                    self.dedup.running = false;
+                    self.dedup.step = "ошибка".into();
+                    self.dedup.status = format!("вынос не удался: {err}");
+                    self.dedup.finished = Some(format!(
+                        "вынос не удался: {err}\n\n\
+                         Данные не пострадали: книги, которые не успели переехать, \
+                         остались в библиотеке. Перезапустите — вынос продолжит с места."
+                    ));
+                    self.error = Some(err);
+                    self.reload_library();
                 }
             }
         }
@@ -620,18 +849,25 @@ impl App {
 /// `LIBRARY_AVIF_SPEED`, `LIBRARY_WEBP` и остальных.
 ///
 /// `--out <каталог>` кладёт результат в указанный каталог, а не рядом с файлом.
+///
+/// `--cover` кодирует картинку как обложку — качество `LIBRARY_COVER_QUALITY`
+/// и без пола по `min_side`. Это ровно та ветка, которой пользуется импорт,
+/// поэтому найденная со стороны обложка ложится в `data/covers/` такими же
+/// байтами, как если бы она пришла из EPUB.
 fn run_image_mode(args: &[String]) -> i32 {
     let mut files: Vec<PathBuf> = Vec::new();
     let mut out_dir: Option<PathBuf> = None;
+    let mut is_cover = false;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--out" | "-o" => out_dir = it.next().map(PathBuf::from),
+            "--cover" => is_cover = true,
             other => files.push(PathBuf::from(other)),
         }
     }
     if files.is_empty() {
-        eprintln!("использование: library_gui --image <картинка>… [--out каталог]");
+        eprintln!("использование: library_gui --image <картинка>… [--out каталог] [--cover]");
         return 2;
     }
 
@@ -665,7 +901,7 @@ fn run_image_mode(args: &[String]) -> i32 {
             }
         };
 
-        let done = match images::optimize_single(&name, &data, &cfg) {
+        let done = match images::optimize_single(&name, &data, &cfg, is_cover) {
             Ok(Some(done)) => done,
             Ok(None) => {
                 eprintln!("[!] {}: не удалось декодировать", src.display());
@@ -748,6 +984,11 @@ fn main() -> eframe::Result<()> {
             "                                            как при импорте (AVIF)\n",
             "  library_gui --bench <zip> [каталог]       бенчмарк всех шагов сжатия\n",
             "                                            (по умолчанию data/bench)\n",
+            "  library_gui --dedup [data_dir] [--dry-run] [--jobs N]\n",
+            "                                            вынести дубликаты по плану\n",
+            "                                            dedup_out/plan.tsv в dublicate/\n",
+            "                                            (без окна; --dry-run — только\n",
+            "                                            показать, что уедет)\n",
             "\n",
             "Каталог данных:\n",
             "  archives/       архивы <от>-<до>.arx (один на входной ZIP)\n",
@@ -759,6 +1000,25 @@ fn main() -> eframe::Result<()> {
             "  failed/         FB2, которые не собрались (копия перед удалением ZIP)\n",
         ));
         std::process::exit(0);
+    }
+
+    // Вынос дубликатов без окна: `library_gui --dedup [data_dir] [--dry-run]`.
+    // Обычный запуск исполняет план, `--dry-run` только печатает, что уедет.
+    if args.first().map(String::as_str) == Some("--dedup") {
+        let mut data_dir = PathBuf::from("data");
+        let mut dry_run = false;
+        let mut jobs = 0usize;
+        let mut it = args[1..].iter();
+        while let Some(arg) = it.next() {
+            match arg.as_str() {
+                "--dry-run" => dry_run = true,
+                "--jobs" => {
+                    jobs = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                }
+                other => data_dir = PathBuf::from(other),
+            }
+        }
+        std::process::exit(run_headless_dedup(&data_dir, dry_run, jobs));
     }
 
     // Служебный режим без окна:
@@ -875,7 +1135,8 @@ fn main() -> eframe::Result<()> {
     }
 
     // Служебный режим без окна:
-    // `library_gui --search <запрос> [data_dir] [--author X] [--genre Y]`.
+    // `library_gui --search <запрос> [data_dir] [--author X] [--genre Y]
+    // [--show-short]`. Статьи и заметки спрятаны, как и в окне.
     if args.first().map(String::as_str) == Some("--search") {
         let mut query = String::new();
         let mut query_set = false;
@@ -885,12 +1146,19 @@ fn main() -> eframe::Result<()> {
         let mut genre: Option<String> = None;
         let mut page = 1usize;
         let mut per_page = db::DEFAULT_SEARCH_LIMIT;
+        let mut show_short = false;
+        let mut cover_filter = db::CoverFilter::All;
 
         let mut it = args[1..].iter();
         while let Some(arg) = it.next() {
             match arg.as_str() {
                 "--author" => author = it.next().cloned(),
                 "--genre" => genre = it.next().cloned(),
+                // Показать и статьи с заметками: в окне это галочка.
+                "--show-short" => show_short = true,
+                // Галочки по обложке: в окне это две галочки.
+                "--coverless" => cover_filter = db::CoverFilter::WithoutCover,
+                "--with-cover" => cover_filter = db::CoverFilter::WithCover,
                 // Листание выдачи из консоли — тем же кодом, что и в окне.
                 "--page" => page = it.next().and_then(|v| v.parse().ok()).unwrap_or(1),
                 "--per-page" => {
@@ -916,9 +1184,21 @@ fn main() -> eframe::Result<()> {
             data_dir,
             author.as_deref(),
             genre.as_deref(),
+            show_short,
+            cover_filter,
             page.max(1),
             per_page,
         ));
+    }
+
+    // Пересборка поискового индекса: нужна после ручной правки метаданных,
+    // иначе Tantivy продолжает искать по старым названиям и авторам.
+    if args.first().map(String::as_str) == Some("--reindex") {
+        let data_dir = args
+            .get(1)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("data"));
+        std::process::exit(run_reindex(data_dir));
     }
 
     // Первый аргумент — каталог данных (по умолчанию `data` рядом с бинарником).
@@ -1151,12 +1431,73 @@ fn run_bench(zip: PathBuf, out_dir: PathBuf) -> i32 {
     0
 }
 
-fn run_headless_import(zip: &Path, data_dir: &Path, delete: bool) -> i32 {
+/// Вынос дубликатов без окна: тот же код, что и за кнопкой.
+///
+/// Нужен для двух вещей: прогнать полную очистку библиотеки, не держа окно
+/// открытым, и проверить всю цепочку на копии данных. `--dry-run` ничего не
+/// трогает — только читает план и печатает, что уедет.
+fn run_headless_dedup(data_dir: &Path, dry_run: bool, jobs: usize) -> i32 {
+    let Some(path) = dedup::find_plan(data_dir) else {
+        eprintln!(
+            "не найден план: ожидается {}/{} (постройте: python3 dedup.py --phash)",
+            dedup::REPORT_DIR,
+            dedup::PLAN_NAME
+        );
+        return 2;
+    };
+    let plan = match dedup::Plan::load(&path) {
+        Ok(plan) => plan,
+        Err(err) => {
+            eprintln!("[фатально] {err:#}");
+            return 2;
+        }
+    };
+    let (books, archives, bytes) = plan.summary();
     emit(format!(
-        "импорт {} → {}",
-        zip.display(),
-        data_dir.join("archives").display()
+        "план {}: книг {books}, архивов {archives}, объём {}",
+        path.display(),
+        human_size(bytes)
     ));
+    emit(format!("дубликаты переезжают в {}", dedup::dublicate_dir(data_dir).display()));
+    if dry_run {
+        emit("--dry-run: ничего не меняем");
+        return 0;
+    }
+    let jobs = if jobs == 0 { dedup::default_jobs() } else { jobs };
+    emit(format!("пересборка архивов в {jobs} потоков"));
+    // Прогресс приходит из нескольких потоков сразу, поэтому «предыдущий шаг»
+    // лежит под мьютексом: замыкание должно остаться `Fn + Sync`.
+    let last_step = std::sync::Mutex::new(String::new());
+    let report = |progress: dedup::Progress| {
+        let step = progress.step.title().to_string();
+        let mut previous = last_step.lock().unwrap_or_else(|err| err.into_inner());
+        // В консоли печатаем не каждую книгу, а смену шага и каждые 10 %
+        // внутри шага: иначе «архивы» выдают 230 строк подряд.
+        let edge = *previous != step
+            || progress.total == 0
+            || progress.done == progress.total
+            || progress.done % (progress.total / 10).max(1) == 0;
+        if edge {
+            emit(format!(
+                "[{}] {}/{} {}",
+                step, progress.done, progress.total, progress.status
+            ));
+        }
+        *previous = step;
+    };
+    match dedup::execute(&plan, data_dir, jobs, &report) {
+        Ok(outcome) => {
+            emit(outcome.report());
+            if outcome.errors.is_empty() { 0 } else { 1 }
+        }
+        Err(err) => {
+            eprintln!("[фатально] {err:#}");
+            2
+        }
+    }
+}
+
+fn run_headless_import(zip: &Path, data_dir: &Path, delete: bool) -> i32 {
     let (tx, rx) = unbounded();
     let settings = ImportSettings {
         delete_zip: delete,
@@ -1206,17 +1547,63 @@ fn run_headless_import(zip: &Path, data_dir: &Path, delete: bool) -> i32 {
                 eprintln!("[фатально] {err}");
                 return 2;
             }
+            // Вынос дубликатов идёт только через окно, здесь таких сообщений нет.
+            WorkerMsg::DedupProgress { .. }
+            | WorkerMsg::DedupDone(_)
+            | WorkerMsg::DedupFailed(_) => {}
         }
     }
     1
 }
 
 /// Поиск без окна: печатает результаты и проверяет извлечение первой книги.
+/// Пересобрать поисковый индекс из метаданных.
+///
+/// Tantivy хранит собственные копии названий и авторов. Если метаданные
+/// поправили снаружи (например, скриптом `data/tmp/fix_titles.py`), поиск
+/// продолжит искать по старым значениям — пока индекс не собран заново.
+fn run_reindex(data_dir: PathBuf) -> i32 {
+    let started = std::time::Instant::now();
+    let mut library = match Library::open(&data_dir) {
+        Ok(l) => l,
+        Err(err) => {
+            eprintln!("[фатально] не удалось открыть библиотеку: {err:#}");
+            return 2;
+        }
+    };
+    println!("книг в метаданных: {}", library.books.len());
+    // `Library::open` уже замечает устаревшую схему, убирает старый индекс в
+    // `index.bak-*` и пересобирает новый из метаданных. Второй проход сделал
+    // бы ровно ту же работу ещё раз, поэтому его пропускаем.
+    if library.schema_upgraded {
+        println!(
+            "схема индекса обновилась — индекс пересобран за {:.0} с",
+            started.elapsed().as_secs_f64()
+        );
+        return 0;
+    }
+    match library.rebuild_index() {
+        Ok(()) => {
+            println!(
+                "индекс пересобран за {:.0} с",
+                started.elapsed().as_secs_f64()
+            );
+            0
+        }
+        Err(err) => {
+            eprintln!("[фатально] не удалось пересобрать индекс: {err:#}");
+            2
+        }
+    }
+}
+
 fn run_headless_search(
     query: &str,
     data_dir: PathBuf,
     author: Option<&str>,
     genre: Option<&str>,
+    show_short: bool,
+    cover_filter: db::CoverFilter,
     page: usize,
     per_page: usize,
 ) -> i32 {
@@ -1230,7 +1617,15 @@ fn run_headless_search(
     emit(format!("книг в библиотеке: {}", library.books.len()));
 
     let offset = (page - 1).saturating_mul(per_page);
-    let hits = match library.search(query, author, genre, offset, per_page) {
+    let hits = match library.search(
+        query,
+        author,
+        genre,
+        show_short,
+        cover_filter,
+        offset,
+        per_page,
+    ) {
         Ok(h) => h,
         Err(err) => {
             eprintln!("[фатально] поиск не удался: {err:#}");
@@ -1251,6 +1646,11 @@ fn run_headless_search(
             ),
         }
     ));
+    // Строгий поиск ничего не нашёл, и выдача собрана резервным запросом с
+    // одной опечаткой: предупреждаем в консоли, как и в интерфейсе.
+    if hits.approximate {
+        emit("возможно, в запросе опечатка — показаны похожие");
+    }
     emit(format!(
         "фасеты: авторов {}, жанров {}",
         hits.authors.len(),
@@ -1260,14 +1660,19 @@ fn run_headless_search(
         let d = &book.details;
         let year = if d.year.is_empty() { d.date.as_str() } else { d.year.as_str() };
         emit(format!(
-            "  {} | {} | {} | {} | {} | год: {} | глав: {}",
+            "  {} | {} | {} | {} | {} | год: {} | глав: {} | слов: {}",
             book.id,
             book.title,
             book.author,
             book.genres.join(", "),
             book.archive,
             if year.is_empty() { "—" } else { year },
-            d.chapters.len()
+            d.chapters.len(),
+            // Пусто — счёт не проставлен (запись старого импорта).
+            book.words.map_or_else(
+                || "—".to_string(),
+                |words| format!("{words} (≈{} стр.)", words / 250),
+            )
         ));
     }
 
@@ -1329,7 +1734,10 @@ mod tests {
             internal_path: format!("{id}.epub"),
             cover: None,
             details: db::Details::default(),
-            size: 100,
+            size: 500_000,
+            // Обычная книга: 50 000 слов, прятать нечего.
+            words: Some(50_000),
+            hidden: false,
         }
     }
 
@@ -1390,6 +1798,89 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
+
+    /// Подсказки автора не зависят от текущей выдачи.
+    ///
+    /// Словарь собирается из всего индекса при старте `App`, а фасеты
+    /// (`app.authors`) — только по текущей выдаче. Здесь поиск оставляет в
+    /// выдаче одного автора, но второй всё равно находится в подсказках.
+    #[test]
+    fn app_suggests_authors_outside_the_current_hits() -> Result<()> {
+        let dir = std::env::temp_dir().join("library_gui_test_app_author_dict");
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let lib = Library::open(&dir)?;
+            let books = vec![
+                BookMetadata {
+                    author: "Михаил Булгаков".to_string(),
+                    ..sample_book(1, "Мастер и Маргарита")
+                },
+                BookMetadata {
+                    author: "Фёдор Достоевский".to_string(),
+                    ..sample_book(2, "Преступление и наказание")
+                },
+            ];
+            lib.append_metadata("1-2", &books)?;
+            let mut writer = lib.writer()?;
+            lib.index_books(&mut writer, &books)?;
+        }
+
+        let mut app = App::new(dir.clone())?;
+        assert_eq!(app.author_dictionary.len(), 2, "словарь собран из индекса");
+
+        // Запрос оставляет в выдаче только Булгакова — фасеты сужаются до него.
+        app.query = "Мастер".to_string();
+        app.refresh_search()?;
+        assert_eq!(app.matched, 1);
+        assert_eq!(
+            app.authors,
+            vec![("Михаил Булгаков".to_string(), 1)],
+            "фасеты считаются по текущей выдаче"
+        );
+
+        // Подсказки — по всему словарю, а не по фасетам: Достоевский
+        // находится, хотя в выдаче его книг нет.
+        let found = app
+            .author_dictionary
+            .suggestions("дост", crate::author_suggest::MAX_SUGGESTIONS);
+        assert_eq!(
+            found,
+            vec![("Фёдор Достоевский".to_string(), 1)],
+            "автор вне текущей выдачи всё равно подсказывается"
+        );
+
+        // И интерфейс рисует подсказку именно из словаря: в фасетах её нет,
+        // поэтому текст кадра может появиться только из `author_dictionary`.
+        app.author_query = "дост".to_string();
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1400.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let mut texts = Vec::new();
+        for _ in 0..2 {
+            let mut rendered = ctx.run_ui(input.clone(), |ui| {
+                ui::draw(&mut app, ui);
+            });
+            rendered.textures_delta.clear();
+            texts.clear();
+            for clipped in &rendered.shapes {
+                collect_texts(&clipped.shape, &mut texts);
+            }
+        }
+        let all = texts.join(" | ");
+        assert!(
+            all.contains("Фёдор Достоевский"),
+            "подсказка автора не появилась в интерфейсе: {all}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
     /// Собрать весь текст, который интерфейс отрисовал в кадре.
     fn collect_texts(shape: &egui::Shape, out: &mut Vec<String>) {
         match shape {
@@ -1507,6 +1998,97 @@ mod tests {
             "оба архива должны быть отмечены как несостоявшиеся"
         );
         assert!(app.import.queue.is_empty(), "очередь должна опустеть");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Кнопка выноса дубликатов стоит в верхней строке главного окна.
+    #[test]
+    fn ui_renders_dedup_button() -> Result<()> {
+        let dir = std::env::temp_dir().join("library_gui_test_ui_dedup_button");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let mut app = App::new(dir.clone())?;
+
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1400.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let mut texts = Vec::new();
+        for _ in 0..2 {
+            let mut rendered = ctx.run_ui(input.clone(), |ui| {
+                ui::draw(&mut app, ui);
+            });
+            rendered.textures_delta.clear();
+            texts.clear();
+            for clipped in &rendered.shapes {
+                collect_texts(&clipped.shape, &mut texts);
+            }
+        }
+        let all = texts.join(" | ");
+        assert!(all.contains("Убрать дубликаты"), "нет кнопки выноса: {all}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Кнопка находит план и окно показывает, что именно уедет.
+    #[test]
+    fn ui_renders_dedup_dialog() -> Result<()> {
+        let dir = std::env::temp_dir().join("library_gui_test_ui_dedup");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("data").join("metadata"))?;
+        let mut app = App::new(dir.join("data"))?;
+        // План лежит там, где его ищет кнопка: ../dedup_out/plan.tsv.
+        let out = dir.join("dedup_out");
+        std::fs::create_dir_all(&out)?;
+        std::fs::write(
+            out.join("plan.tsv"),
+            "id\tarchive\tinternal_path\tcover\tgroup_id\ttitle\tauthor\tyear\tsize\tkeeper_id\treason\n\
+             7\t1-9.arx\t7.epub\t1-9/7.avif\tg000001\tКнига\tАвтор\t2001\t123\t9\tisbn\n",
+        )?;
+        app.open_dedup_dialog();
+        assert!(app.dedup.dialog.is_some(), "план не прочитался");
+        assert_eq!(app.dedup.dialog.as_ref().unwrap().books, 1);
+
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let mut texts = Vec::new();
+        for _ in 0..2 {
+            let mut rendered = ctx.run_ui(input.clone(), |ui| {
+                ui::draw(&mut app, ui);
+            });
+            rendered.textures_delta.clear();
+            texts.clear();
+            for clipped in &rendered.shapes {
+                collect_texts(&clipped.shape, &mut texts);
+            }
+        }
+        let all = texts.join(" | ");
+        assert!(all.contains("Убрать дубликаты"), "нет окна выноса: {all}");
+        assert!(all.contains("Переезжает в"), "не сказано, куда уедет: {all}");
+        assert!(all.contains("dublicate"), "нет каталога назначения: {all}");
+        assert!(all.contains("Вынести дубликаты"), "нет кнопки запуска: {all}");
+
+        // Без плана кнопка объясняет, что делать, а не падает.
+        std::fs::remove_file(out.join("plan.tsv"))?;
+        app.dedup.dialog = None;
+        app.error = None;
+        app.open_dedup_dialog();
+        assert!(app.dedup.dialog.is_none());
+        let message = app.error.clone().unwrap_or_default();
+        assert!(message.contains("dedup.py"), "нет подсказки: {message}");
 
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())

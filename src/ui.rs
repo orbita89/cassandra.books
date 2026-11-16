@@ -1,7 +1,7 @@
 //! Отрисовка интерфейса.
 //!
 //! Четыре зоны:
-//!   * верхняя панель — поиск, фильтры по автору и жанру, импорт, кэш;
+//!   * верхняя панель — поиск, фильтры по автору, жанру и обложке, импорт, кэш;
 //!   * центральная — сетка обложек (если обложки нет — название книги);
 //!   * окно книги — все метаданные, аннотация, главы и кнопка «Читать»;
 //!     открывается кликом по обложке, а не висит сбоку постоянно;
@@ -12,8 +12,9 @@
 //! Панели должны добавляться до центральной — она забирает остаток места.
 //! Исключение — [`egui::Window`]: он по-прежнему раскрывается в контекст.
 
+use crate::author_suggest::MAX_SUGGESTIONS;
 use crate::db::BookMetadata;
-use crate::{human_size, App, CACHE_LIMIT_BYTES};
+use crate::{dedup, human_size, App, CACHE_LIMIT_BYTES};
 use anyhow::{Context, Result};
 use egui::{Color32, RichText, Stroke};
 use std::path::Path;
@@ -36,6 +37,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     book_window(app, ui);
     error_window(app, ui);
     zip_picker_window(app, ui);
+    dedup_window(app, ui);
 
     // Поиск «на лету»: как только текст изменился — пересчитываем результаты.
     if app.query != app.last_query {
@@ -53,7 +55,10 @@ fn top_panel(app: &mut App, ui: &mut egui::Ui) {
     // Фильтры правим в локальных копиях и записываем обратно после панели:
     // так вложенные замыкания egui не конфликтуют за поля `App`.
     let mut filter_author = app.filter_author.clone();
+    let mut author_query = app.author_query.clone();
     let mut filter_genre = app.filter_genre.clone();
+    let mut show_short = app.show_short;
+    let mut cover_filter = app.cover_filter;
     let authors = app.authors.clone();
     let genres = app.genres.clone();
     let mut filters_changed = false;
@@ -117,6 +122,28 @@ fn top_panel(app: &mut App, ui: &mut egui::Ui) {
                 app.settings.delete_zip = delete_zip;
             }
             if importing {
+                ui.spinner();
+            }
+
+            ui.separator();
+            // Вынос дубликатов: план составляет dedup.py, кнопка его
+            // показывает и исполняет. Во время импорта не предлагаем —
+            // оба процесса трогают одни и те же архивы.
+            let dedup_busy = app.dedup.running || importing;
+            ui.add_enabled_ui(!dedup_busy, |ui| {
+                if ui
+                    .button("🧬 Убрать дубликаты")
+                    .on_hover_text(
+                        "Найденные дубликаты переезжают в dublicate/ рядом с data/, \
+                         архивы, обложки, метаданные и индекс чистятся.\n\
+                         Нужен план: python3 dedup.py --phash",
+                    )
+                    .clicked()
+                {
+                    app.open_dedup_dialog();
+                }
+            });
+            if app.dedup.running {
                 ui.spinner();
             }
 
@@ -204,15 +231,88 @@ fn top_panel(app: &mut App, ui: &mut egui::Ui) {
                 if ui.button("✖ сбросить фильтры").clicked() {
                     filter_author = None;
                     filter_genre = None;
+                    // Поле автодополнения — часть того же фильтра, чистим и его.
+                    author_query.clear();
                     filters_changed = true;
                 }
             }
+
+            // Короткие записи прячутся по умолчанию: объём текста у них на
+            // порядок меньше, чем у книги, и в выдаче они мешают.
+            ui.add_space(10.0);
+            if ui
+                .checkbox(&mut show_short, "статьи и заметки")
+                .on_hover_text(format!(
+                    "Книга — это файл больше {} КБ и текст длиннее {} слов (≈{} страниц). \
+                     Всё, что меньше, прячется: статьи, заметки, брошюры и обрывки. \
+                     Остаются только стихи и малые формы по жанру (рассказы, сказки, \
+                     анекдоты, мифы), а также авторы из keep_authors.txt. Совсем пустые \
+                     записи — обложка и оглавление, меньше {} слов — прячутся в любом \
+                     случае. Галочка возвращает спрятанное в выдачу.",
+                    crate::db::MIN_FILE_BYTES / 1000,
+                    crate::db::MIN_BOOK_WORDS,
+                    crate::db::MIN_BOOK_WORDS / 250,
+                    crate::db::JUNK_WORDS
+                ))
+                .changed()
+            {
+                filters_changed = true;
+            }
+
+            // Книг без обложки около 34 тысяч против 328 тысяч с обложкой —
+            // в общей выдаче они тонут. Две галочки позволяют смотреть каждую
+            // половину отдельно. Вместе их поставить нельзя: состояние — один
+            // из трёх вариантов, поэтому включение одной снимает другую.
+            let mut with_cover = cover_filter.with_cover();
+            let mut without_cover = cover_filter.without_cover();
+            ui.horizontal(|ui| {
+                if ui
+                    .checkbox(&mut with_cover, "только с обложкой")
+                    .on_hover_text(
+                        "Показать только книги с обложкой — книги без обложки \
+                         прячутся. Снятые обе галочки возвращают весь список.",
+                    )
+                    .changed()
+                {
+                    cover_filter = if with_cover {
+                        crate::db::CoverFilter::WithCover
+                    } else {
+                        crate::db::CoverFilter::All
+                    };
+                    filters_changed = true;
+                }
+                if ui
+                    .checkbox(&mut without_cover, "без обложки")
+                    .on_hover_text(
+                        "Показать только книги без обложки — те, кому обложку \
+                         ещё предстоит найти.",
+                    )
+                    .changed()
+                {
+                    cover_filter = if without_cover {
+                        crate::db::CoverFilter::WithoutCover
+                    } else {
+                        crate::db::CoverFilter::All
+                    };
+                    filters_changed = true;
+                }
+            });
 
             ui.add_space(14.0);
             let pages = app.pages();
             let first_index = app.page * app.page_size;
             let shown_to = (first_index + app.results.len()).min(app.filtered);
             ui.label(RichText::new(format!("Найдено: {}", app.filtered)).strong());
+            // Выдача собрана резервным запросом с одной опечаткой: честно
+            // предупреждаем, что совпадения приблизительные. Строка короткая и
+            // того же вида, что остальные подписи над списком.
+            if app.approximate {
+                ui.label(
+                    RichText::new("возможно, в запросе опечатка — показаны похожие")
+                        .small()
+                        .color(Color32::from_rgb(214, 168, 72)),
+                );
+            }
             if app.filtered > 0 {
                 ui.label(
                     RichText::new(format!(
@@ -309,12 +409,62 @@ fn top_panel(app: &mut App, ui: &mut egui::Ui) {
                 }
             });
         });
+
+        // ---- строка 4: автодополнение автора -------------------------------
+        // Подсказки — из словаря всех авторов индекса
+        // (`App::author_dictionary`), а не из фасетов текущей выдачи: автор за
+        // пределами топ-500 иначе не появился бы в подсказках никогда.
+        // Tantivy при наборе не трогается — словарь собран заранее. Список
+        // показываем только с трёх символов: на 1–2 буквах он не нужен.
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Автор (подсказки):").color(Color32::from_gray(170)));
+            ui.add_sized(
+                [260.0, 22.0],
+                egui::TextEdit::singleline(&mut author_query)
+                    .hint_text("начните вводить фамилию — от 3 букв")
+                    .desired_width(260.0),
+            )
+            .on_hover_text(format!(
+                "Подсказки ищутся по началу любого слова имени.\n\
+                 Авторов в словаре: {} (весь индекс, а не текущая выдача).",
+                app.author_dictionary.len()
+            ));
+        });
+        let suggestions = app
+            .author_dictionary
+            .suggestions(&author_query, MAX_SUGGESTIONS);
+        if !suggestions.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                for (name, count) in &suggestions {
+                    let selected = filter_author.as_deref() == Some(name.as_str());
+                    if ui
+                        .selectable_label(selected, format!("{name}  ({count})"))
+                        .clicked()
+                    {
+                        // То же, что и клик в выпадающем списке выше.
+                        filter_author = Some(name.clone());
+                        filters_changed = true;
+                    }
+                }
+            });
+        }
         ui.add_space(6.0);
     });
+
+    // Ввод в поле автора сохраняем всегда, но НЕ через `filters_changed`:
+    // набор текста не должен пересчитывать выдачу и обращаться к Tantivy.
+    // Поиск обновится, когда пользователь выберет подсказку (или сбросит
+    // фильтры), — тогда `filters_changed` выставит сам клик.
+    if app.author_query != author_query {
+        app.author_query = author_query;
+    }
 
     if filters_changed {
         app.filter_author = filter_author;
         app.filter_genre = filter_genre;
+        app.show_short = show_short;
+        app.cover_filter = cover_filter;
         // Фильтр меняет весь список, поэтому возвращаемся на первую страницу.
         // Раньше смена фильтра вообще не пересчитывала выдачу: она обновлялась
         // только при следующей правке строки поиска.
@@ -457,10 +607,46 @@ fn cell(ui: &mut egui::Ui, book: &BookMetadata, dir: &Path, selected: bool) -> e
     } else {
         book.author.as_str()
     };
-    response.on_hover_text(format!(
-        "{}\n{}\n\nнажмите, чтобы открыть информацию",
-        book.title, author
-    ))
+    response.on_hover_text(match short_mark(book) {
+        Some(mark) => format!(
+            "{}\n{}\n\n{mark}\nнажмите, чтобы открыть информацию",
+            book.title, author
+        ),
+        None => format!(
+            "{}\n{}\n\nнажмите, чтобы открыть информацию",
+            book.title, author
+        ),
+    })
+}
+
+/// «1 слово», «2 слова», «5 слов» — по-русски, а не «2 слов».
+fn words_label(n: u64) -> String {
+    let (tail100, tail10) = (n % 100, n % 10);
+    let word = if (11..=14).contains(&tail100) {
+        "слов"
+    } else if tail10 == 1 {
+        "слово"
+    } else if (2..=4).contains(&tail10) {
+        "слова"
+    } else {
+        "слов"
+    };
+    format!("{n} {word}")
+}
+
+/// Пометка для статьи, заметки или обрывка; `None` — обычная книга.
+///
+/// Такие записи библиотека прячет из выдачи (см. [`crate::db::MIN_BOOK_WORDS`]),
+/// поэтому когда их всё-таки показывают, надо видеть, что это не книга.
+fn short_mark(book: &BookMetadata) -> Option<String> {
+    let words = book.words?;
+    book.hidden.then(|| {
+        format!(
+            "не книга — статья или заметка, {} (≈{} страниц)",
+            words_label(words),
+            words / 250
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -497,6 +683,13 @@ fn book_window(app: &mut App, ui: &mut egui::Ui) {
             ui.heading(&book.title);
             if !book.author.trim().is_empty() {
                 ui.label(RichText::new(&book.author).italics().size(15.0));
+            }
+            if let Some(mark) = short_mark(&book) {
+                ui.label(
+                    RichText::new(mark)
+                        .size(13.0)
+                        .color(Color32::from_rgb(226, 178, 92)),
+                );
             }
 
             // Кнопка «Читать» — сразу под названием, а не в конце длинной
@@ -556,6 +749,14 @@ fn book_window(app: &mut App, ui: &mut egui::Ui) {
             ui.separator();
             let d = &book.details;
             field(ui, "Размер", &format!("{:.0} КБ", book.size as f64 / 1024.0));
+            // Объём в словах и страницах: по нему видно, книга это или статья.
+            if let Some(words) = book.words {
+                field(
+                    ui,
+                    "Объём",
+                    &format!("{} (≈{} страниц)", words_label(words), words / 250),
+                );
+            }
             field(ui, "Архив", &book.archive);
             field(ui, "Внутри", &book.internal_path);
             field(ui, "ID книги", &book.id.to_string());
@@ -675,7 +876,9 @@ fn bottom_panel(app: &mut App, ui: &mut egui::Ui) {
         || !app.import.errors.is_empty()
         || !app.import.deleted.is_empty()
         || !app.import.kept.is_empty()
-        || !app.import.failed_files.is_empty();
+        || !app.import.failed_files.is_empty()
+        || app.dedup.running
+        || app.dedup.finished.is_some();
     if !show {
         return;
     }
@@ -683,8 +886,84 @@ fn bottom_panel(app: &mut App, ui: &mut egui::Ui) {
     let mut hide = false;
     egui::Panel::bottom("progress_panel").show(ui, |ui| {
         ui.add_space(4.0);
+        // Импорт показывает ту же панель, но только когда он сам что-то
+        // делает или рассказывает; во время выноса дубликатов — молчит.
+        if dedup_progress(app, ui) {
+            return;
+        }
+        if app.import.running
+            || app.import.finished.is_some()
+            || app.import.last_batch.is_some()
+            || !app.import.errors.is_empty()
+            || !app.import.deleted.is_empty()
+            || !app.import.kept.is_empty()
+            || !app.import.failed_files.is_empty()
+        {
+            import_progress(app, ui, &mut hide);
+        }
+    });
+    if hide {
+        app.import.finished = None;
+        app.import.last_batch = None;
+        app.import.deleted.clear();
+        app.import.kept.clear();
+        app.import.failed_files.clear();
+        app.import.errors.clear();
+    }
+}
 
-        ui.horizontal(|ui| {
+/// Полоса прогресса выноса дубликатов. `true` — что-то нарисовали.
+fn dedup_progress(app: &mut App, ui: &mut egui::Ui) -> bool {
+    if !app.dedup.running && app.dedup.finished.is_none() {
+        return false;
+    }
+    let mut hide = false;
+    ui.horizontal(|ui| {
+        if app.dedup.running {
+            ui.spinner();
+        } else {
+            ui.label("🧬");
+        }
+        ui.label(
+            RichText::new(format!("вынос дубликатов · {}", app.dedup.step)).strong(),
+        );
+        ui.label(&app.dedup.status);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if !app.dedup.running && ui.small_button("скрыть").clicked() {
+                hide = true;
+            }
+        });
+    });
+    if app.dedup.running && app.dedup.total > 0 {
+        ui.add(
+            egui::ProgressBar::new(app.dedup.fraction())
+                .show_percentage()
+                .animate(true),
+        );
+        ui.label(
+            RichText::new(format!("{} из {}", app.dedup.done, app.dedup.total))
+                .small()
+                .color(Color32::from_gray(150)),
+        );
+    }
+    if let Some(report) = &app.dedup.finished {
+        ui.label(
+            RichText::new(report.clone())
+                .small()
+                .color(Color32::from_gray(170)),
+        );
+    }
+    if hide {
+        app.dedup.finished = None;
+        app.dedup.status.clear();
+        app.dedup.step.clear();
+    }
+    true
+}
+
+/// Прогресс импорта: то, что панель показывала и раньше.
+fn import_progress(app: &mut App, ui: &mut egui::Ui, hide: &mut bool) {
+    ui.horizontal(|ui| {
             if app.import.running {
                 ui.spinner();
             } else {
@@ -706,7 +985,7 @@ fn bottom_panel(app: &mut App, ui: &mut egui::Ui) {
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if !app.import.running && ui.small_button("скрыть").clicked() {
-                    hide = true;
+                    *hide = true;
                 }
                 ui.label(
                     RichText::new(format!(
@@ -850,10 +1129,8 @@ fn bottom_panel(app: &mut App, ui: &mut egui::Ui) {
                 },
             );
         }
-        ui.add_space(4.0);
-    });
-
-    if hide {
+    ui.add_space(4.0);
+    if *hide {
         app.import = crate::ImportState::default();
     }
 }
@@ -1057,5 +1334,106 @@ fn zip_picker_window(app: &mut App, ui: &mut egui::Ui) {
         app.zip_picker = None;
     } else {
         app.zip_picker = Some(picker);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Окно «Убрать дубликаты»
+// ---------------------------------------------------------------------------
+
+/// Подтверждение выноса: что уедет, куда и сколько места это вернёт.
+///
+/// Ничего не удаляется: книги переезжают в `dublicate/` рядом с `data/`.
+/// Поэтому окно показывает именно перенос и оставляет план на диске —
+/// по `dedup_out/plan.tsv` всегда видно, что и почему убрали.
+fn dedup_window(app: &mut App, ui: &mut egui::Ui) {
+    let Some(dialog) = app.dedup.dialog.take() else {
+        return;
+    };
+    let ctx = ui.ctx().clone();
+    let dest = dedup::dublicate_dir(&app.library.data_dir);
+    let mut open = true;
+    let mut start = false;
+    let mut cancel = false;
+
+    egui::Window::new("🧬 Убрать дубликаты")
+        .collapsible(false)
+        .resizable(false)
+        .default_width(620.0)
+        .open(&mut open)
+        .show(&ctx, |ui| {
+            if dialog.books == 0 {
+                ui.label("План пуст: дубликатов для выноса не нашлось.");
+                if ui.button("Закрыть").clicked() {
+                    cancel = true;
+                }
+                return;
+            }
+            ui.label(format!(
+                "К выносу: {} книг в {} архивах ({}).",
+                dialog.books,
+                dialog.archives,
+                human_size(dialog.bytes)
+            ));
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(format!("Переезжает в: {}", dest.display()))
+                    .strong(),
+            );
+            ui.add_space(6.0);
+            ui.label("Что произойдёт:");
+            ui.label("  • книги этих копий уедут из .arx в dublicate/archives/;");
+            ui.label("  • обложки — в dublicate/covers/;");
+            ui.label("  • строки метаданных — в dublicate/metadata/;");
+            ui.label("  • архивы пересоберутся без них, индекс соберётся заново.");
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(
+                    "Ничего не удаляется безвозвратно. Архив подменяется только \
+                     после проверки, что новый читается и содержит всё остальное. \
+                     Прервёте — повторный запуск продолжит с места.",
+                )
+                .small()
+                .color(Color32::from_gray(150)),
+            );
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(format!(
+                    "Освободится в библиотеке: {}. Ровно столько же займёт {}.",
+                    human_size(dialog.bytes),
+                    dest.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "dublicate".into())
+                ))
+                .small()
+                .color(Color32::from_rgb(220, 190, 120)),
+            );
+            ui.add_space(8.0);
+            ui.separator();
+            ui.label(
+                RichText::new(format!("План: {}", dialog.plan.path.display()))
+                    .small()
+                    .color(Color32::from_gray(140)),
+            );
+            ui.horizontal(|ui| {
+                if ui
+                    .button(RichText::new("🧬 Вынести дубликаты").strong())
+                    .clicked()
+                {
+                    start = true;
+                }
+                if ui.button("Отмена").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+
+    if start {
+        app.dedup.dialog = Some(dialog);
+        app.start_dedup();
+    } else if cancel || !open {
+        app.dedup.dialog = None;
+    } else {
+        app.dedup.dialog = Some(dialog);
     }
 }
