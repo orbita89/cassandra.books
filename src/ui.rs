@@ -21,6 +21,12 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 /// Видимая ширина ячейки сетки обложек.
+/// Пауза после последнего нажатия, после которой запускается поиск.
+const SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(300);
+/// Порог коротких запросов — общий с ядром: пока он не набран, выдача на
+/// экране остаётся прежней (ядро на такой запрос отдало бы пустоту).
+use crate::db::MIN_QUERY_CHARS;
+
 const CELL_W: f32 = 118.0;
 /// Высота ячейки: обложка 3:4 плюс немного воздуха.
 const CELL_H: f32 = 166.0;
@@ -39,10 +45,21 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     zip_picker_window(app, ui);
     dedup_window(app, ui);
 
-    // Поиск «на лету»: как только текст изменился — пересчитываем результаты.
+    // Поиск «на лету», но не на каждую букву: ждём паузу SEARCH_DEBOUNCE
+    // после последнего нажатия (Enter и «Сбросить» — сразу). Пока слово
+    // недописано, промежуточные «прес», «прест»… не ищутся вовсе — а именно
+    // на них строгий поиск ничего не находит и запускает дорогой fuzzy-каскад.
     if app.query != app.last_query {
-        if let Err(err) = app.refresh_search() {
-            app.error = Some(format!("поиск не удался: {err:#}"));
+        let typed = app.query.trim().chars().count();
+        let too_short = typed > 0 && typed < MIN_QUERY_CHARS;
+        let wait = SEARCH_DEBOUNCE.saturating_sub(app.query_edited_at.elapsed());
+        if too_short {
+            app.search_now = false;
+        } else if !app.search_now && !wait.is_zero() {
+            ui.ctx().request_repaint_after(wait);
+        } else {
+            app.search_now = false;
+            app.start_search();
         }
     }
 }
@@ -76,7 +93,7 @@ fn top_panel(app: &mut App, ui: &mut egui::Ui) {
             ui.heading("📚 Библиотека");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
-                    RichText::new(format!("книг: {}", app.library.books.len()))
+                    RichText::new(format!("книг: {}", app.lib().books.len()))
                         .color(Color32::from_gray(160)),
                 );
             });
@@ -88,14 +105,30 @@ fn top_panel(app: &mut App, ui: &mut egui::Ui) {
         // и панель раздувается на сотни пикселей. Поэтому он вынесен выше.
         ui.horizontal_wrapped(|ui| {
             ui.label("Поиск:");
-            ui.add_sized(
+            let edit = ui.add_sized(
                 [320.0, 22.0],
                 egui::TextEdit::singleline(&mut app.query)
-                    .hint_text("название, автор, аннотация…")
+                    .hint_text("название, автор, аннотация… (от 3 букв)")
                     .desired_width(320.0),
             );
+            if edit.changed() {
+                app.query_edited_at = std::time::Instant::now();
+                // Подсказки — двоичный поиск по словарям в памяти, без
+                // Tantivy, поэтому их можно считать сразу, без паузы.
+                app.update_suggestions();
+            }
+            if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                app.search_now = true;
+                app.hide_suggestions();
+            }
             if ui.button("Сбросить").clicked() {
                 app.query.clear();
+                app.search_now = true;
+                app.hide_suggestions();
+            }
+            // Поиск идёт в фоновом потоке — показываем, что ответ ещё в пути.
+            if app.searching {
+                ui.spinner();
             }
 
             ui.separator();
@@ -173,6 +206,47 @@ fn top_panel(app: &mut App, ui: &mut egui::Ui) {
                 clear_cache = true;
             }
         });
+
+        // ---- строка 2½: подсказки к строке поиска --------------------------
+        // Клик по книге — поиск по её точному названию; клик по автору —
+        // фильтр по автору (строка поиска очищается, иначе фильтр сочетался
+        // бы с недописанным текстом).
+        if !app.suggest_titles.is_empty() || !app.suggest_authors.is_empty() {
+            let mut picked_title: Option<String> = None;
+            let mut picked_author: Option<String> = None;
+            ui.horizontal_wrapped(|ui| {
+                for (title, count) in &app.suggest_titles {
+                    let text = if *count > 1 {
+                        format!("📖 {title}  ({count})")
+                    } else {
+                        format!("📖 {title}")
+                    };
+                    if ui.selectable_label(false, text).clicked() {
+                        picked_title = Some(title.clone());
+                    }
+                }
+                for (name, count) in &app.suggest_authors {
+                    if ui
+                        .selectable_label(false, format!("👤 {name}  ({count})"))
+                        .clicked()
+                    {
+                        picked_author = Some(name.clone());
+                    }
+                }
+            });
+            if let Some(title) = picked_title {
+                app.query = title;
+                app.search_now = true;
+                app.hide_suggestions();
+            }
+            if let Some(name) = picked_author {
+                app.query.clear();
+                app.search_now = true;
+                app.hide_suggestions();
+                filter_author = Some(name);
+                filters_changed = true;
+            }
+        }
 
         // ---- строка 3: фильтры по автору и жанру ---------------------------
         ui.add_space(6.0);
@@ -480,9 +554,7 @@ fn top_panel(app: &mut App, ui: &mut egui::Ui) {
         app.selected = None;
     }
     if filters_changed || page_changed {
-        if let Err(err) = app.refresh_search() {
-            app.error = Some(format!("поиск не удался: {err:#}"));
-        }
+        app.start_search();
     }
     if clear_cache {
         app.clear_cache();
@@ -497,7 +569,7 @@ fn cover_grid(app: &mut App, ui: &mut egui::Ui) {
     let mut clicked: Option<usize> = None;
     let selected = app.selected;
     let opened = app.details_open;
-    let dir = app.library.covers_dir();
+    let dir = app.lib().covers_dir();
 
     egui::CentralPanel::default().show(ui, |ui| {
         let results = &app.results;
@@ -716,7 +788,7 @@ fn book_window(app: &mut App, ui: &mut egui::Ui) {
                 if let Some(cover) = book
                     .cover
                     .as_ref()
-                    .map(|name| app.library.covers_dir().join(name))
+                    .map(|name| app.lib().covers_dir().join(name))
                     .filter(|p| p.exists())
                 {
                     ui.add(
@@ -806,7 +878,7 @@ fn book_window(app: &mut App, ui: &mut egui::Ui) {
 
     if let Some(Action::Read) = action {
         // Кэш мог перерасти предел — урезаем до чтения.
-        let _ = app.library.prune_cache(CACHE_LIMIT_BYTES);
+        let _ = app.lib().prune_cache(CACHE_LIMIT_BYTES);
         let result = read_book(app, &book);
         match result {
             Ok(msg) => app.toast = Some(msg),
@@ -842,11 +914,11 @@ fn series_line(series: &str, number: &str) -> String {
 
 /// Распаковать книгу в `data/cache` и открыть системной читалкой.
 fn read_book(app: &App, book: &BookMetadata) -> Result<String> {
-    let dir = app.library.cache_dir();
+    let dir = app.lib().cache_dir();
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("не удалось создать {}", dir.display()))?;
     let dest = dir.join(&book.internal_path);
-    app.library.extract_to(book, &dest)?;
+    app.lib().extract_to(book, &dest)?;
 
     // Сначала пробуем читалку для EPUB, потом — системный обработчик по умолчанию.
     // Вывод читалки глушим: иначе её предупреждения (у Foliate это WebKit
@@ -1177,7 +1249,7 @@ fn zip_picker_window(app: &mut App, ui: &mut egui::Ui) {
         return;
     };
     let ctx = ui.ctx().clone();
-    let archives_dir = app.library.archives_dir();
+    let archives_dir = app.lib().archives_dir();
     // Архивы, которые уже стоят в очереди или импортируются прямо сейчас.
     let busy: Vec<String> = app
         .import
@@ -1351,7 +1423,7 @@ fn dedup_window(app: &mut App, ui: &mut egui::Ui) {
         return;
     };
     let ctx = ui.ctx().clone();
-    let dest = dedup::dublicate_dir(&app.library.data_dir);
+    let dest = dedup::dublicate_dir(&app.lib().data_dir);
     let mut open = true;
     let mut start = false;
     let mut cancel = false;

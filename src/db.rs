@@ -27,15 +27,29 @@ use tantivy::schema::{
     STORED, STRING, TEXT,
 };
 use tantivy::tokenizer::{
-    Language, LowerCaser, SimpleTokenizer, Stemmer, TextAnalyzer, TokenStream,
+    Language, LowerCaser, RemoveLongFilter, SimpleTokenizer, Stemmer, TextAnalyzer, Token,
+    TokenFilter, TokenStream, Tokenizer,
 };
 use tantivy::{
     doc, DocAddress, Index, IndexReader, IndexWriter, Order, ReloadPolicy, Score, Searcher,
     TantivyDocument,
 };
 
-/// Бюджет памяти Tantivy при индексации — не больше 50 МБ (требование ТЗ).
-pub const INDEX_MEMORY_BUDGET: usize = 50 * 1024 * 1024;
+/// Бюджет памяти Tantivy при индексации — 30 МБ на единственный поток
+/// индексации (минимум Tantivy — 15 МБ). Сегмент сбрасывается на диск, как
+/// только буфер дорастает до бюджета, так что больше RAM writer не возьмёт.
+pub const INDEX_MEMORY_BUDGET: usize = 30 * 1024 * 1024;
+
+/// Потоков индексации. Один: импорт и так занимает CPU конвертацией картинок,
+/// а слабому серверу второй поток индексации лишь отнимает ядро у поиска.
+const INDEX_WRITER_THREADS: usize = 1;
+
+/// Потоков слияния сегментов (по умолчанию Tantivy берёт 4).
+const INDEX_MERGE_THREADS: usize = 1;
+
+/// Слияние запускается, когда на одном уровне набралось столько сегментов:
+/// реже сливаем — меньше пиков CPU и диска, а 8 сегментов поиску не мешают.
+const MERGE_MIN_SEGMENTS: usize = 8;
 
 /// Сколько книг за один коммит при полной пересборке индекса.
 ///
@@ -55,6 +69,12 @@ pub const MAX_PAGE_SIZE: usize = 2000;
 
 /// Размеры страницы, которые предлагает интерфейс.
 pub const PAGE_SIZES: [usize; 6] = [50, 100, 200, 500, 1000, MAX_PAGE_SIZE];
+
+/// Запросы короче (по буквам/цифрам после нормализации) в Tantivy не уходят:
+/// `search` сразу отдаёт пустой результат. Пустой запрос — просмотр всей
+/// библиотеки, отсечка его не касается. Порог живёт в ядре, чтобы его
+/// получал любой клиент — GUI, консоль и будущий веб-API.
+pub const MIN_QUERY_CHARS: usize = 3;
 
 /// Сколько книг Tantivy отдаёт для построения фасетов (списков авторов и
 /// жанров).
@@ -272,7 +292,7 @@ pub struct Details {
 }
 
 /// Результат поиска вместе с фасетами для фильтров.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SearchOutcome {
     /// Книги запрошенной страницы после фильтров, по алфавиту.
     pub books: Vec<BookMetadata>,
@@ -419,7 +439,7 @@ impl Eq for PageEntry {}
 /// скрывает книги без обложки, «без обложки» оставляет только их. Снятые оба
 /// показывают всё. Вариантов ровно три, поэтому и тип такой: пара независимых
 /// флагов допускала бы противоречивое «и с обложкой, и без».
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CoverFilter {
     /// Все книги, как есть.
     #[default]
@@ -571,6 +591,108 @@ fn filter_clause(term: Term) -> (Occur, Box<dyn Query>) {
     )
 }
 
+/// Сколько последних выдач помнит [`SearchCache`].
+const SEARCH_CACHE_ENTRIES: usize = 64;
+
+/// Страницы больше этого в кеш не кладутся: клон тысячи книг с подробностями
+/// стоит памяти, а такие страницы и так листают редко.
+const SEARCH_CACHE_MAX_BOOKS: usize = 200;
+
+/// Всё, от чего зависит выдача [`Library::search`].
+///
+/// `generation` — отпечаток набора сегментов индекса и их удалений: после
+/// коммита он новый, и старые записи просто перестают совпадать (а затем
+/// вытесняются). Номер поколения Tantivy (`generation_id`) не подходит: он
+/// растёт на любой перезагрузке читателя, даже если индекс не менялся. Смену
+/// метаданных (`reload_metadata`) отпечаток не ловит — там кеш чистится явно.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SearchKey {
+    generation: u64,
+    query: String,
+    author: Option<String>,
+    genre: Option<String>,
+    show_short: bool,
+    cover: CoverFilter,
+    offset: usize,
+    limit: usize,
+}
+
+/// Маленький LRU последних выдач: повтор запроса, возврат к предыдущему
+/// фильтру или странице не трогает Tantivy вообще.
+///
+/// Вытеснение — линейный поиск самой старой записи: при 64 записях это
+/// дешевле и проще, чем отдельная зависимость.
+#[derive(Default)]
+struct SearchCache {
+    tick: u64,
+    entries: HashMap<SearchKey, (u64, SearchOutcome)>,
+}
+
+impl SearchCache {
+    fn get(&mut self, key: &SearchKey) -> Option<SearchOutcome> {
+        self.tick += 1;
+        let tick = self.tick;
+        self.entries.get_mut(key).map(|(used, outcome)| {
+            *used = tick;
+            outcome.clone()
+        })
+    }
+
+    fn put(&mut self, key: SearchKey, outcome: &SearchOutcome) {
+        if outcome.books.len() > SEARCH_CACHE_MAX_BOOKS {
+            return;
+        }
+        if self.entries.len() >= SEARCH_CACHE_ENTRIES && !self.entries.contains_key(&key) {
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (used, _))| *used)
+                .map(|(key, _)| key.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.tick += 1;
+        self.entries.insert(key, (self.tick, outcome.clone()));
+    }
+}
+
+/// Книга в заранее отсортированном списке главной (см. [`Browse`]).
+struct BrowseEntry {
+    id: u64,
+    hidden: bool,
+    has_cover: bool,
+}
+
+/// Фасеты главной: по всей библиотеке, один вариант на значение `show_short`.
+#[derive(Default)]
+struct BrowseFacets {
+    matched: usize,
+    authors: Vec<(String, usize)>,
+    genres: Vec<(String, usize)>,
+}
+
+/// Заранее подготовленная главная — выдача пустого запроса.
+///
+/// Раньше каждый показ главной (листание, смена фильтра) обходил все книги,
+/// переводил каждое название в нижний регистр и набирал страницу кучей: на
+/// 417 тысячах книг это 1–4,6 с. Но ни алфавитный порядок, ни фасеты пустого
+/// запроса между показами не меняются: фасеты считаются по всей библиотеке
+/// без учёта фильтров и зависят только от `show_short`. Поэтому они
+/// считаются один раз — при загрузке метаданных ([`Library::reload_metadata`]),
+/// а показ страницы — это проход по готовому порядку с дешёвыми проверками.
+///
+/// Это и есть «главная, которая не ходит в поиск»: книги по умолчанию и
+/// списки авторов/жанров уже лежат готовыми.
+#[derive(Default)]
+struct Browse {
+    /// Все книги по алфавиту: название в нижнем регистре, затем `id` — тот
+    /// же порядок, что у [`SortKey`] в режиме [`SortMode::Alphabet`].
+    order: Vec<BrowseEntry>,
+    /// `[0]` — короткое спрятано, `[1]` — показано.
+    facets: [BrowseFacets; 2],
+}
+
 /// Открытая библиотека.
 /// Имя анализатора `title`/`author` с русским стеммером (см. [`ru_stem_analyzer`]).
 const RU_STEM_TOKENIZER: &str = "ru_stem";
@@ -586,9 +708,84 @@ const RU_STEM_TOKENIZER: &str = "ru_stem";
 /// writer работает с тем же менеджером, что и [`Library::index`].
 fn ru_stem_analyzer() -> TextAnalyzer {
     TextAnalyzer::builder(SimpleTokenizer::default())
+        .filter(RemoveLongFilter::limit(MAX_TOKEN_BYTES))
         .filter(LowerCaser)
+        .filter(YoFilter)
         .filter(Stemmer::new(Language::Russian))
         .build()
+}
+
+/// Имя анализатора полей `title_raw`/`author_raw` (см. [`ru_raw_analyzer`]).
+const RU_RAW_TOKENIZER: &str = "ru_raw";
+
+/// Токены длиннее (в байтах UTF-8) — мусор (хеши, склейки слов): в индекс не
+/// идут. 80 байт ≈ 40 кириллических букв.
+const MAX_TOKEN_BYTES: usize = 80;
+
+/// Анализатор «сырых» полей: те же слова, что у [`ru_stem_analyzer`], но без
+/// стеммера. По ним работают автокомплит (префикс недописанного слова) и
+/// fuzzy: стеммер обрезает окончания, и опечатка в основе («приступл») уже не
+/// сравнима со словом, которое печатает человек.
+///
+/// Фильтры до стеммера у обоих анализаторов одинаковые — поэтому токены
+/// запроса выравниваются один к одному (см. [`Library::query_terms`]).
+fn ru_raw_analyzer() -> TextAnalyzer {
+    TextAnalyzer::builder(SimpleTokenizer::default())
+        .filter(RemoveLongFilter::limit(MAX_TOKEN_BYTES))
+        .filter(LowerCaser)
+        .filter(YoFilter)
+        .build()
+}
+
+/// Фильтр токенов «ё → е» (ставится после `LowerCaser`).
+///
+/// Свёртка делается и при индексации, и при запросе (анализатор общий), так
+/// что «ёжик»/«ежик», «Королёв»/«Королев» совпадают как точные термы и не
+/// тратят единственную разрешённую опечатку fuzzy.
+#[derive(Clone)]
+struct YoFilter;
+
+impl TokenFilter for YoFilter {
+    type Tokenizer<T: Tokenizer> = YoFilterWrapper<T>;
+
+    fn transform<T: Tokenizer>(self, tokenizer: T) -> Self::Tokenizer<T> {
+        YoFilterWrapper(tokenizer)
+    }
+}
+
+#[derive(Clone)]
+struct YoFilterWrapper<T>(T);
+
+impl<T: Tokenizer> Tokenizer for YoFilterWrapper<T> {
+    type TokenStream<'a> = YoFilterStream<T::TokenStream<'a>>;
+
+    fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
+        YoFilterStream(self.0.token_stream(text))
+    }
+}
+
+struct YoFilterStream<T>(T);
+
+impl<T: TokenStream> TokenStream for YoFilterStream<T> {
+    fn advance(&mut self) -> bool {
+        if !self.0.advance() {
+            return false;
+        }
+        let text = &mut self.0.token_mut().text;
+        // ASCII-токены (латиница, цифры) «ё» не содержат — не трогаем.
+        if !text.is_ascii() && text.contains('ё') {
+            *text = text.replace('ё', "е");
+        }
+        true
+    }
+
+    fn token(&self) -> &Token {
+        self.0.token()
+    }
+
+    fn token_mut(&mut self) -> &mut Token {
+        self.0.token_mut()
+    }
 }
 
 /// Нормализация значения для полей-ключей `title_key`/`author_key`.
@@ -655,6 +852,8 @@ struct IndexFields {
     id: Field,
     title: Field,
     author: Field,
+    title_raw: Field,
+    author_raw: Field,
     title_key: Field,
     author_key: Field,
     genres: Field,
@@ -702,6 +901,21 @@ fn build_schema() -> (Schema, IndexFields) {
     );
     // Ключи — `STRING` (raw-токенизатор): нормализованное значение целиком
     // лежит одним термом, поэтому `Basic` (без частот и позиций) достаточно.
+    // «Сырые» копии названия и автора — без стеммера (см. [`ru_raw_analyzer`]).
+    // Только индекс, без stored; `Basic` — ни частот, ни позиций: префиксу и
+    // fuzzy нужно лишь «есть ли слово в книге», а так поля почти ничего не
+    // весят.
+    let raw_indexing = TextFieldIndexing::default()
+        .set_tokenizer(RU_RAW_TOKENIZER)
+        .set_index_option(IndexRecordOption::Basic);
+    let f_title_raw = builder.add_text_field(
+        "title_raw",
+        TextOptions::default().set_indexing_options(raw_indexing.clone()),
+    );
+    let f_author_raw = builder.add_text_field(
+        "author_raw",
+        TextOptions::default().set_indexing_options(raw_indexing),
+    );
     let f_title_key = builder.add_text_field("title_key", STRING | STORED);
     let f_author_key = builder.add_text_field("author_key", STRING | STORED);
     // Старое поле с жанрами одной строкой. Оставлено (в stored-виде) для
@@ -729,6 +943,8 @@ fn build_schema() -> (Schema, IndexFields) {
             id: f_id,
             title: f_title,
             author: f_author,
+            title_raw: f_title_raw,
+            author_raw: f_author_raw,
             title_key: f_title_key,
             author_key: f_author_key,
             genres: f_genres,
@@ -795,6 +1011,10 @@ pub struct Library {
     f_id: Field,
     f_title: Field,
     f_author: Field,
+    /// Название без стеммера — для автокомплита и fuzzy.
+    f_title_raw: Field,
+    /// Автор без стеммера — для автокомплита.
+    f_author_raw: Field,
     /// Нормализованное название целиком — для точного совпадения.
     f_title_key: Field,
     /// Нормализованный автор целиком — для точного совпадения.
@@ -821,6 +1041,11 @@ pub struct Library {
     /// Авторы из `hide_authors.txt`: у них короткое прячется всегда, даже
     /// если правило выше их считает настоящими.
     hide_authors: Vec<String>,
+    /// Последние выдачи (см. [`SearchCache`]). `Mutex`, потому что `search`
+    /// берёт `&self`, а библиотеку читает и поток поиска.
+    search_cache: std::sync::Mutex<SearchCache>,
+    /// Готовая главная (см. [`Browse`]); пересобирается в `reload_metadata`.
+    browse: Browse,
     /// Сколько раз реально выполнялся резервный (fuzzy) запрос.
     ///
     /// Существует только в тестовой сборке: в бою счётчик не нужен, а тестам
@@ -857,14 +1082,13 @@ const FUZZY_DISTANCE: u8 = 1;
 // Эти константы относятся только к каскаду [`Library::search`]: строгий запрос
 // fuzzy по `title` не использует вовсе (см. [`Library::build_full_text_query`]).
 
-/// Fuzzy по `title` — только для стемов не короче этого.
+/// Fuzzy по `title_raw` — только для слов (как напечатаны) не короче этого.
 ///
-/// Порог выше, чем у автора ([`FUZZY_MIN_TERM_LEN`] = 4), и считается по
-/// **стему**: словарь названий на порядок больше словаря авторов, и при
-/// расстоянии 1 четырёхбуквенный стем находит «почти любое» слово («дом» ↔
-/// «том», «сад» ↔ «зад»). Пять букв — минимум, на котором опечатка ещё
-/// выделяется, а мусор не лезет в выдачу.
-const FUZZY_TITLE_MIN_TERM_LEN: usize = 5;
+/// Трёхбуквенные слова при расстоянии 1 находят «почти любое» слово («дом» ↔
+/// «том», «сад» ↔ «зад»), поэтому порог — 4 буквы: «шрэк» → «шрек» ещё
+/// исправляется. Шум ограничен тем, что fuzzy работает только в каскаде —
+/// когда строгий запрос (с автокомплитом) не нашёл ничего.
+const FUZZY_TITLE_MIN_TERM_LEN: usize = 4;
 
 /// Расстояние Левенштейна для fuzzy по `title` — ровно одна опечатка.
 const FUZZY_TITLE_DISTANCE: u8 = 1;
@@ -908,6 +1132,23 @@ const STOP_WORDS_RU: &[&str] = &[
 /// Ниже точного терма по `title` ([`BOOST_TITLE_TERM`] = 2.0): приблизительное
 /// совпадение обязано стоять ниже точного. Клауза добавлена как `SHOULD` внутри
 /// `MUST`-группы терма, а не заменяет точный терм.
+/// Вес автокомплита: недописанное слово совпало с началом слова названия или
+/// автора. Ниже точного терма названия ([`BOOST_TITLE_TERM`]), выше fuzzy.
+const BOOST_PREFIX: Score = 1.5;
+
+/// Автокомплит — только для слов не короче (как напечатано): префикс из двух
+/// букв раскрывается в тысячи слов словаря.
+const PREFIX_MIN_LEN: usize = 3;
+
+/// Сколько слов словаря максимум подставляется вместо префикса (самые частые).
+/// Это и есть защита CPU: «пре» в словаре названий — тысячи слов, а запрос
+/// становится объединением не более чем стольких списков.
+const PREFIX_MAX_TERMS: usize = 64;
+
+/// Сколько слов словаря просматривать на сегмент в поисках частых. Проход по
+/// FST дешёвый, но без потолка «пре» читало бы весь хвост словаря.
+const PREFIX_SCAN_LIMIT: usize = 4_000;
+
 const BOOST_TITLE_FUZZY: Score = 0.5;
 
 /// Вес самого строгого запроса как `SHOULD`-клаузы резервного.
@@ -969,6 +1210,13 @@ struct QueryTerm {
     stem: String,
 }
 
+/// Запрос, разобранный один раз на поиск (см. [`Library::parse_query`]).
+struct ParsedQuery {
+    terms: Vec<QueryTerm>,
+    /// Автокомплит последнего слова — `None`, если слово дописано или коротко.
+    prefix: Option<Box<dyn Query>>,
+}
+
 /// Служебное ли это слово (список — [`STOP_WORDS_RU`]).
 fn is_stop_word(raw: &str) -> bool {
     STOP_WORDS_RU.contains(&raw)
@@ -992,13 +1240,14 @@ fn fuzzy_title_distance(stem: &str) -> u8 {
 ///   * стемы короче [`FUZZY_TITLE_MIN_TERM_LEN`] — у короткого стема соседом по
 ///     Левенштейну оказывается почти любое слово.
 ///
-/// Длина берётся от стема, потому что fuzzy ищет именно по словарю стемов.
+/// Длина берётся от слова как напечатано: fuzzy ищет по словарю `title_raw`
+/// (без стеммера), так что «шрэк» (4 буквы) исправляется в «шрек».
 fn title_fuzzy_terms(terms: &[QueryTerm]) -> Vec<usize> {
     terms
         .iter()
         .enumerate()
         .filter(|(_, term)| {
-            !is_stop_word(&term.raw) && term.stem.chars().count() >= FUZZY_TITLE_MIN_TERM_LEN
+            !is_stop_word(&term.raw) && term.raw.chars().count() >= FUZZY_TITLE_MIN_TERM_LEN
         })
         .map(|(index, _)| index)
         .collect()
@@ -1059,6 +1308,7 @@ impl Library {
         // открытии создаётся заново. Writer делит этот менеджер с индексом
         // (Arc), поэтому регистрация здесь видна и индексации, и поиску.
         index.tokenizers().register(RU_STEM_TOKENIZER, ru_stem_analyzer());
+        index.tokenizers().register(RU_RAW_TOKENIZER, ru_raw_analyzer());
 
         let reader = index
             .reader_builder()
@@ -1076,6 +1326,8 @@ impl Library {
             f_id: fields.id,
             f_title: fields.title,
             f_author: fields.author,
+            f_title_raw: fields.title_raw,
+            f_author_raw: fields.author_raw,
             f_title_key: fields.title_key,
             f_author_key: fields.author_key,
             f_genres: fields.genres,
@@ -1088,6 +1340,8 @@ impl Library {
             books: HashMap::new(),
             keep_authors,
             hide_authors,
+            search_cache: std::sync::Mutex::default(),
+            browse: Browse::default(),
             #[cfg(test)]
             fallback_searches: std::sync::atomic::AtomicU64::new(0),
         };
@@ -1234,6 +1488,12 @@ impl Library {
     /// Перечитать метаданные в память: все файлы `data/metadata/*.jsonl`
     /// плюс старый единый файл, если он остался с прошлых версий.
     pub fn reload_metadata(&mut self) -> Result<()> {
+        // Книги и пометки «спрятано» меняются — старые выдачи недействительны.
+        self.search_cache
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries
+            .clear();
         self.books.clear();
         let dir = self.metadata_dir();
         let mut files: Vec<PathBuf> = fs::read_dir(&dir)
@@ -1254,6 +1514,7 @@ impl Library {
             self.load_metadata_file(&path)?;
         }
         self.mark_short_items();
+        self.browse = self.build_browse();
         Ok(())
     }
 
@@ -1277,6 +1538,17 @@ impl Library {
     /// Список отсортирован по имени. В индекс эта функция не пишет ничего:
     /// Tantivy используется только на чтение, поэтому схема не меняется и
     /// размер индекса не растёт.
+    /// Названия для словаря подсказок ([`crate::title_suggest::TitleDictionary`]):
+    /// по одному на книгу, без спрятанных (их и поиск по умолчанию не
+    /// показывает). Склейку одинаковых названий делает сам словарь.
+    pub fn title_dictionary(&self) -> Vec<(String, usize)> {
+        self.books
+            .values()
+            .filter(|book| !book.hidden)
+            .map(|book| (book.title.clone(), 1))
+            .collect()
+    }
+
     pub fn author_dictionary(&self) -> Result<Vec<(String, usize)>> {
         let searcher = self.reader.searcher();
         let mut counts: HashMap<String, usize> = HashMap::new();
@@ -1374,6 +1646,107 @@ impl Library {
     /// Считается один раз при загрузке: библиотека меняется только вместе
     /// с метаданными. Отметка нужна интерфейсу — по ней видно, что запись
     /// показана только из-за галочки «статьи и заметки».
+    /// Собрать [`Browse`] по текущим метаданным.
+    fn build_browse(&self) -> Browse {
+        let mut keyed: Vec<(String, BrowseEntry)> = self
+            .books
+            .values()
+            .map(|book| {
+                (
+                    book.title.to_lowercase(),
+                    BrowseEntry {
+                        id: book.id,
+                        hidden: book.hidden,
+                        has_cover: book.cover.is_some(),
+                    },
+                )
+            })
+            .collect();
+        keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.id.cmp(&b.1.id)));
+        let order = keyed.into_iter().map(|(_, entry)| entry).collect();
+
+        let facets = [false, true].map(|show_short| {
+            let mut acc = Facets::new(0, show_short, CoverFilter::All, SortMode::Alphabet);
+            for book in self.books.values() {
+                acc.count(book);
+            }
+            BrowseFacets {
+                matched: acc.matched,
+                authors: sort_counts(acc.authors),
+                genres: sort_counts(acc.genres),
+            }
+        });
+        Browse { order, facets }
+    }
+
+    /// Страница пустого запроса по готовой [`Browse`].
+    ///
+    /// Обложка проверяется по метаданным (то же значение пишется в индекс как
+    /// `has_cover`), автор и жанр — запросом к Tantivy: там нужна та же
+    /// нормализация, что и при индексации.
+    #[allow(clippy::too_many_arguments)]
+    fn browse_page(
+        &self,
+        author: Option<&str>,
+        genre: Option<&str>,
+        show_short: bool,
+        cover: CoverFilter,
+        offset: usize,
+        limit: usize,
+    ) -> Result<SearchOutcome> {
+        let facets = &self.browse.facets[usize::from(show_short)];
+        let index_filters = self.filter_clauses(author, genre, CoverFilter::All);
+        let selected_ids = if index_filters.is_empty() {
+            None
+        } else {
+            let mut clauses: Vec<(Occur, Box<dyn Query>)> =
+                Vec::with_capacity(index_filters.len() + 1);
+            clauses.push((Occur::Must, Box::new(AllQuery)));
+            clauses.extend(index_filters);
+            Some(self.matching_ids(&BooleanQuery::new(clauses))?)
+        };
+        // Без фильтров число книг уже известно — проход можно оборвать, как
+        // только страница набрана.
+        let unfiltered = selected_ids.is_none() && cover == CoverFilter::All;
+
+        let end = offset.saturating_add(limit);
+        let mut books = Vec::with_capacity(limit.min(self.browse.order.len()));
+        let mut filtered = 0usize;
+        for entry in &self.browse.order {
+            if !show_short && entry.hidden {
+                continue;
+            }
+            if (cover.with_cover() && !entry.has_cover)
+                || (cover.without_cover() && entry.has_cover)
+            {
+                continue;
+            }
+            if let Some(ids) = &selected_ids {
+                if ids.binary_search(&entry.id).is_err() {
+                    continue;
+                }
+            }
+            if filtered >= offset && filtered < end {
+                if let Some(book) = self.books.get(&entry.id) {
+                    books.push(book.clone());
+                }
+            }
+            filtered += 1;
+            if unfiltered && filtered >= end {
+                filtered = facets.matched;
+                break;
+            }
+        }
+        Ok(SearchOutcome {
+            books,
+            authors: facets.authors.clone(),
+            genres: facets.genres.clone(),
+            matched: facets.matched,
+            filtered,
+            approximate: false,
+        })
+    }
+
     fn mark_short_items(&mut self) {
         let marks: Vec<(u64, bool)> = self
             .books
@@ -1423,9 +1796,19 @@ impl Library {
 
     /// Открыть writer для добавления книг в индекс (не больше 50 МБ памяти).
     pub fn writer(&self) -> Result<IndexWriter<TantivyDocument>> {
-        self.index
-            .writer::<TantivyDocument>(INDEX_MEMORY_BUDGET)
-            .context("не удалось открыть writer Tantivy")
+        let options = tantivy::indexer::IndexWriterOptions::builder()
+            .memory_budget_per_thread(INDEX_MEMORY_BUDGET)
+            .num_worker_threads(INDEX_WRITER_THREADS)
+            .num_merge_threads(INDEX_MERGE_THREADS)
+            .build();
+        let writer = self
+            .index
+            .writer_with_options::<TantivyDocument>(options)
+            .context("не удалось открыть writer Tantivy")?;
+        let mut merge_policy = tantivy::indexer::LogMergePolicy::default();
+        merge_policy.set_min_num_segments(MERGE_MIN_SEGMENTS);
+        writer.set_merge_policy(Box::new(merge_policy));
+        Ok(writer)
     }
 
     /// Собрать индекс заново из `self.books`.
@@ -1471,6 +1854,8 @@ impl Library {
                 self.f_id => book.id,
                 self.f_title => book.title.clone(),
                 self.f_author => book.author.clone(),
+                self.f_title_raw => book.title.clone(),
+                self.f_author_raw => book.author.clone(),
                 // Ключи — та же нормализация, что и в запросе
                 // ([`normalize_key`]): значение целиком, одним термом.
                 self.f_title_key => normalize_key(&book.title),
@@ -1555,7 +1940,55 @@ impl Library {
         offset: usize,
         limit: usize,
     ) -> Result<SearchOutcome> {
+        let key = SearchKey {
+            generation: {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                self.reader.searcher().generation().segments().hash(&mut hasher);
+                hasher.finish()
+            },
+            query: query.to_owned(),
+            author: author.map(str::to_owned),
+            genre: genre.map(str::to_owned),
+            show_short,
+            cover,
+            offset,
+            limit,
+        };
+        if let Some(hit) = self.search_cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+            return Ok(hit);
+        }
+        // Сам поиск — без блокировки кеша: второй поток не должен его ждать.
+        let outcome =
+            self.search_uncached(query, author, genre, show_short, cover, offset, limit)?;
+        self.search_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .put(key, &outcome);
+        Ok(outcome)
+    }
+
+    /// [`Self::search`] без кеша. Публичный для замера (`--bench-search`):
+    /// он меряет цену именно поиска, а не попадания в кеш.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_uncached(
+        &self,
+        query: &str,
+        author: Option<&str>,
+        genre: Option<&str>,
+        show_short: bool,
+        cover: CoverFilter,
+        offset: usize,
+        limit: usize,
+    ) -> Result<SearchOutcome> {
+        // Необрезанный запрос нужен автокомплиту: пробел в конце значит
+        // «слово дописано», и префикс подставлять не надо.
+        let untrimmed = query;
         let query = query.trim();
+        let typed = normalize_key(query).chars().filter(|c| c.is_alphanumeric()).count();
+        if typed > 0 && typed < MIN_QUERY_CHARS {
+            return Ok(SearchOutcome::default());
+        }
 
         // Режим отбора страницы: непустой запрос — по релевантности (лучший
         // score первым), пустой — по алфавиту, как обычный просмотр.
@@ -1573,12 +2006,20 @@ impl Library {
 
         // Текстовый запрос **без** фильтров: нужен фасетам и счётчику
         // `matched`, которые обязаны видеть книги, не прошедшие фильтр.
-        let text_query = if query.is_empty() {
+        // Пустой запрос — готовая главная, без Tantivy и без обхода с кучей.
+        if query.is_empty() {
+            return self.browse_page(author, genre, show_short, cover, offset, limit);
+        }
+
+        let parsed = if query.is_empty() {
             None
         } else {
-            self.build_full_text_query(query)
-                .with_context(|| format!("не удалось разобрать запрос `{query}`"))?
+            Some(
+                self.parse_query(untrimmed)
+                    .with_context(|| format!("не удалось разобрать запрос `{query}`"))?,
+            )
         };
+        let text_query = parsed.as_ref().and_then(|p| self.strict_query(untrimmed, p));
 
         // Пометка «совпадения приблизительные»: ставится только каскадом
         // (см. ниже) и только если резервный запрос что-то нашёл. Пустой запрос
@@ -1587,31 +2028,9 @@ impl Library {
 
         match text_query {
             None => {
-                // Пустой текст: фильтр (если он есть) применяет Tantivy, но
-                // страницу собираем обходом метаданных — Tantivy не даст
-                // алфавитный порядок при равных score.
-                let selected_ids = if filter_clauses.is_empty() {
-                    None
-                } else {
-                    let mut clauses: Vec<(Occur, Box<dyn Query>)> =
-                        Vec::with_capacity(filter_clauses.len() + 1);
-                    // `AllQuery` в `MUST` — «вся библиотека», поверх неё
-                    // обязательные клаузы фильтров.
-                    clauses.push((Occur::Must, Box::new(AllQuery)));
-                    clauses.extend(filter_clauses);
-                    Some(self.matching_ids(&BooleanQuery::new(clauses))?)
-                };
-                for book in self.books.values() {
-                    acc.count(book);
-                    let selected = selected_ids
-                        .as_ref()
-                        .is_none_or(|ids| ids.binary_search(&book.id).is_ok());
-                    // `filtered` считаем здесь же: обход идёт по всей
-                    // библиотеке, поэтому счётчик точный, а не оценка.
-                    if selected && acc.pick(book, 0.0) {
-                        acc.filtered += 1;
-                    }
-                }
+                // В запросе нет ни одного слова (одни знаки) — это та же
+                // главная, что и у пустого запроса.
+                return self.browse_page(author, genre, show_short, cover, offset, limit);
             }
             Some(text_query) => {
                 let searcher = self.reader.searcher();
@@ -1636,9 +2055,10 @@ impl Library {
                     // ранга; собираем его заново — это холодная ветка, и
                     // повторный разбор запроса здесь дешевле, чем клон запроса
                     // на каждом обычном поиске.
-                    let strict = self.build_full_text_query(query)?;
+                    let parsed = parsed.as_ref().expect("непустой запрос разобран выше");
+                    let strict = self.strict_query(untrimmed, parsed);
                     if let Some(strict) = strict {
-                        if let Some(fallback) = self.build_fuzzy_fallback_query(query, &*strict)? {
+                        if let Some(fallback) = self.fallback_query(parsed, &*strict) {
                             // Счётчик только в тестовой сборке: по нему тесты
                             // отличают «резервный запрос не запускался» от
                             // «запускался, но ничего не нашёл».
@@ -1718,6 +2138,38 @@ impl Library {
         filter_clauses: Vec<(Occur, Box<dyn Query>)>,
         keep: usize,
     ) -> Result<usize> {
+        // Без фильтров оба прохода ниже — один и тот же запрос. Тогда он
+        // выполняется **один** раз: верхушка в `SEARCH_FETCH_CAP` книг идёт и в
+        // фасеты, и в страницу (накопитель страницы сам держит не больше
+        // `keep` лучших), а `Count` даёт честный `filtered`.
+        if filter_clauses.is_empty() {
+            let (hits, total) =
+                self.page_hits(searcher, &*text_query, SEARCH_FETCH_CAP.max(keep))?;
+            let mut floor = Score::MAX;
+            for (id, score, addr) in hits {
+                let owned;
+                let book = match self.books.get(&id) {
+                    Some(book) => book,
+                    None => {
+                        owned = self.book_from_index(searcher, addr, id)?;
+                        &owned
+                    }
+                };
+                acc.count(book);
+                // Хиты идут по убыванию score: когда страница набрана, книга
+                // ниже последнего взятого score на неё уже не попадёт, и
+                // `pick` (с `to_lowercase` названия) для неё не нужен.
+                if acc.books.len() < acc.keep {
+                    acc.pick(book, score);
+                    floor = score;
+                } else if score >= floor {
+                    acc.pick(book, score);
+                }
+            }
+            acc.filtered = total;
+            return Ok(total);
+        }
+
         // Проход 1 — фасеты и `matched` по выдаче без фильтров. Он ограничен
         // [`SEARCH_FETCH_CAP`], как и раньше: фасетам не нужна вся библиотека,
         // список всё равно обрезается.
@@ -1821,10 +2273,34 @@ impl Library {
         Box::new(BooleanQuery::new(clauses))
     }
 
-    /// `id` документа по адресу в индексе.
-    fn doc_id(&self, searcher: &Searcher, addr: DocAddress) -> Result<Option<u64>> {
-        let doc: TantivyDocument = searcher.doc(addr)?;
-        Ok(doc.get_first(self.f_id).and_then(|v| v.as_u64()))
+    /// Колонки fast-поля `id` по сегментам — `id` хита читается из них,
+    /// а не распаковкой stored-документа (это была главная цена запроса:
+    /// до [`SEARCH_FETCH_CAP`] распаковок блоков docstore на один поиск).
+    fn id_columns(&self, searcher: &Searcher) -> Result<Vec<tantivy::columnar::Column<u64>>> {
+        let schema = self.index.schema();
+        let name = schema.get_field_name(self.f_id);
+        searcher
+            .segment_readers()
+            .iter()
+            .map(|seg| seg.fast_fields().u64(name).context("нет fast-поля id"))
+            .collect()
+    }
+
+    /// Пары `(score, адрес)` от `TopDocs` → `(id, score, адрес)`.
+    fn resolve_ids(
+        &self,
+        searcher: &Searcher,
+        hits: Vec<(Score, DocAddress)>,
+    ) -> Result<Vec<(u64, Score, DocAddress)>> {
+        let columns = self.id_columns(searcher)?;
+        Ok(hits
+            .into_iter()
+            .filter_map(|(score, addr)| {
+                columns[addr.segment_ord as usize]
+                    .first(addr.doc_id)
+                    .map(|id| (id, score, addr))
+            })
+            .collect())
     }
 
     /// Верхушка выдачи `(id, score, адрес)` в порядке релевантности.
@@ -1842,13 +2318,7 @@ impl Library {
         let hits = searcher
             .search(query, &TopDocs::with_limit(cap).order_by_score())
             .context("ошибка поиска")?;
-        let mut out = Vec::with_capacity(hits.len());
-        for (score, addr) in hits {
-            if let Some(id) = self.doc_id(searcher, addr)? {
-                out.push((id, score, addr));
-            }
-        }
-        Ok(out)
+        self.resolve_ids(searcher, hits)
     }
 
     /// Верхушка выдачи и **честное** число совпадений за один проход.
@@ -1867,13 +2337,7 @@ impl Library {
         let (hits, total) = searcher
             .search(query, &(TopDocs::with_limit(keep).order_by_score(), Count))
             .context("ошибка поиска")?;
-        let mut out = Vec::with_capacity(hits.len());
-        for (score, addr) in hits {
-            if let Some(id) = self.doc_id(searcher, addr)? {
-                out.push((id, score, addr));
-            }
-        }
-        Ok((out, total))
+        Ok((self.resolve_ids(searcher, hits)?, total))
     }
 
     /// `id` всех книг, подошедших под запрос (обычно это фильтр без текста).
@@ -1968,12 +2432,14 @@ impl Library {
             stems.push(token.text.clone());
         }
 
-        // Исходные слова — тот же `SimpleTokenizer` + `LowerCaser`, но без
-        // стеммера. Стеммер не добавляет и не удаляет токены, поэтому списки
-        // выравниваются один к одному; стоп-слова проверяются по `raw`.
-        let mut lower = TextAnalyzer::builder(SimpleTokenizer::default())
-            .filter(LowerCaser)
-            .build();
+        // Исходные слова — анализатор поля `title_raw`: те же фильтры, что у
+        // `title`, но без стеммера. Стеммер не добавляет и не удаляет токены,
+        // поэтому списки выравниваются один к одному; стоп-слова, автокомплит
+        // и fuzzy работают по `raw`.
+        let mut lower = self
+            .index
+            .tokenizer_for_field(self.f_title_raw)
+            .context("не удалось получить анализатор поля title_raw")?;
         let mut raw_stream = lower.token_stream(query);
         let mut raws = Vec::with_capacity(stems.len());
         while let Some(token) = raw_stream.next() {
@@ -2027,9 +2493,26 @@ impl Library {
     /// Возвращает `None`, если в запросе не осталось ни одного терма
     /// (пустая строка или одни разделители).
     fn build_full_text_query(&self, query: &str) -> Result<Option<Box<dyn Query>>> {
+        let parsed = self.parse_query(query)?;
+        Ok(self.strict_query(query, &parsed))
+    }
+
+    /// Разобрать запрос один раз: термы и префикс автокомплита.
+    ///
+    /// Префикс — самое дорогое в разборе (проход по словарю), поэтому строгий
+    /// запрос, его повторная сборка в каскаде и резервный запрос берут его
+    /// отсюда, а не считают заново.
+    fn parse_query(&self, query: &str) -> Result<ParsedQuery> {
         let terms = self.query_terms(query)?;
+        let prefix = self.last_word_prefix(query, &terms)?;
+        Ok(ParsedQuery { terms, prefix })
+    }
+
+    /// Строгий запрос по уже разобранным термам (см. [`Self::build_full_text_query`]).
+    fn strict_query(&self, query: &str, parsed: &ParsedQuery) -> Option<Box<dyn Query>> {
+        let terms = &parsed.terms;
         if terms.is_empty() {
-            return Ok(None);
+            return None;
         }
 
         // У `title` есть и частоты, и позиции (нужны фразе), у `author` —
@@ -2049,8 +2532,10 @@ impl Library {
 
         // Строгий запрос: fuzzy по `title` не включаем — им занимается только
         // резервный каскад (см. [`Self::build_fuzzy_fallback_query`]).
-        for term in &terms {
-            clauses.push(self.per_term_query(&term.stem, false));
+        let last = terms.len() - 1;
+        for (index, term) in terms.iter().enumerate() {
+            let prefix = if index == last { parsed.prefix.as_deref() } else { None };
+            clauses.push(self.per_term_query(term, false, prefix));
         }
 
         // Точная фраза целиком — только если термов хотя бы два: для одного
@@ -2101,7 +2586,83 @@ impl Library {
             ));
         }
 
-        Ok(Some(Box::new(BooleanQuery::new(clauses))))
+        Some(Box::new(BooleanQuery::new(clauses)))
+    }
+
+    /// Префиксный запрос для последнего слова, если оно, похоже, недописано.
+    ///
+    /// Слово считается недописанным, если запрос не кончается пробелом или
+    /// знаком (человек ещё печатает), это не стоп-слово и в нём не меньше
+    /// [`PREFIX_MIN_LEN`] букв.
+    fn last_word_prefix(
+        &self,
+        query: &str,
+        terms: &[QueryTerm],
+    ) -> Result<Option<Box<dyn Query>>> {
+        let Some(last) = terms.last() else {
+            return Ok(None);
+        };
+        let open_word = query.chars().last().is_some_and(char::is_alphanumeric);
+        if !open_word || is_stop_word(&last.raw) || last.raw.chars().count() < PREFIX_MIN_LEN {
+            return Ok(None);
+        }
+        self.prefix_query(&last.raw)
+    }
+
+    /// Автокомплит: `prefix` → `OR` точных термов `title_raw`/`author_raw`,
+    /// которые с него начинаются.
+    ///
+    /// Почему не edge n-gram: n-граммы 3..10 на 490 тысяч названий умножают
+    /// словарь и постинги в разы — это RAM page cache и диск, которых на слабом
+    /// железе нет. Почему не `RegexQuery("прест.*")`: он подставляет **все**
+    /// слова с префиксом, и короткий префикс превращается в объединение тысяч
+    /// постингов. Здесь словарь (FST) просматривается диапазоном
+    /// `[prefix, …)`, не дальше [`PREFIX_SCAN_LIMIT`] слов на сегмент, и в
+    /// запрос идут только [`PREFIX_MAX_TERMS`] самых частых — цена запроса
+    /// ограничена сверху при любом префиксе.
+    fn prefix_query(&self, prefix: &str) -> Result<Option<Box<dyn Query>>> {
+        let searcher = self.reader.searcher();
+        let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        for field in [self.f_title_raw, self.f_author_raw] {
+            let mut freq: HashMap<Vec<u8>, u64> = HashMap::new();
+            for segment in searcher.segment_readers() {
+                let inverted = segment.inverted_index(field)?;
+                let mut stream = inverted.terms().range().ge(prefix.as_bytes()).into_stream()?;
+                let mut scanned = 0;
+                while scanned < PREFIX_SCAN_LIMIT && stream.advance() {
+                    let key = stream.key();
+                    if !key.starts_with(prefix.as_bytes()) {
+                        break;
+                    }
+                    scanned += 1;
+                    *freq.entry(key.to_vec()).or_default() += u64::from(stream.value().doc_freq);
+                }
+            }
+            let mut words: Vec<(Vec<u8>, u64)> = freq.into_iter().collect();
+            // Частые слова первыми; при равенстве — по алфавиту, чтобы выдача
+            // не зависела от порядка обхода хеш-таблицы.
+            words.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            words.truncate(PREFIX_MAX_TERMS);
+            for (word, _) in words {
+                let Ok(word) = std::str::from_utf8(&word) else {
+                    continue;
+                };
+                clauses.push((
+                    Occur::Should,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(field, word),
+                        IndexRecordOption::Basic,
+                    )),
+                ));
+            }
+        }
+        if clauses.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(Box::new(BoostQuery::new(
+            Box::new(BooleanQuery::new(clauses)),
+            BOOST_PREFIX,
+        ))))
     }
 
     /// `MUST`-группа одного терма: `OR` точных совпадений по `title` и
@@ -2115,7 +2676,13 @@ impl Library {
     /// единственное отличие резервного запроса от строгого. Fuzzy по `author`
     /// (порог [`FUZZY_MIN_TERM_LEN`], расстояние [`FUZZY_DISTANCE`]) есть в
     /// обоих запросах и здесь не меняется.
-    fn per_term_query(&self, stem: &str, title_fuzzy: bool) -> (Occur, Box<dyn Query>) {
+    fn per_term_query(
+        &self,
+        term: &QueryTerm,
+        title_fuzzy: bool,
+        prefix: Option<&dyn Query>,
+    ) -> (Occur, Box<dyn Query>) {
+        let stem = term.stem.as_str();
         // У `title` есть и частоты, и позиции, у `author` — только частоты:
         // `IndexRecordOption` обязан совпадать с опциями поля.
         let mut per_term: Vec<(Occur, Box<dyn Query>)> =
@@ -2154,14 +2721,22 @@ impl Library {
                 )),
             ));
         }
-        // Fuzzy по названию — только резервный запрос и только по стему.
+        // Автокомплит: недописанное последнее слово совпадает по префиксу
+        // (см. [`Self::prefix_query`]).
+        if let Some(prefix) = prefix {
+            per_term.push((Occur::Should, prefix.box_clone()));
+        }
+        // Fuzzy по названию — только резервный запрос, по слову **без**
+        // стеммера (`title_raw`): опечатка сравнивается с тем, что человек
+        // напечатал, а не с обрезанной основой. `true` — перестановка двух
+        // соседних букв стоит одну правку («прсетупление»).
         if title_fuzzy {
             per_term.push((
                 Occur::Should,
                 Box::new(BoostQuery::new(
                     Box::new(FuzzyTermQuery::new(
-                        Term::from_field_text(self.f_title, stem),
-                        fuzzy_title_distance(stem),
+                        Term::from_field_text(self.f_title_raw, &term.raw),
+                        fuzzy_title_distance(&term.raw),
                         true,
                     )),
                     BOOST_TITLE_FUZZY,
@@ -2194,22 +2769,32 @@ impl Library {
     /// коротких слов или одних стоп-слов): тогда резервный запрос не нужен и
     /// не выполняется. `RegexQuery` и `WildcardQuery` здесь не используются —
     /// их в проекте нет вообще.
+    #[allow(dead_code)] // боевой путь — [`Self::fallback_query`]; это для тестов и замера
     fn build_fuzzy_fallback_query(
         &self,
         query: &str,
         strict: &dyn Query,
     ) -> Result<Option<Box<dyn Query>>> {
-        let terms = self.query_terms(query)?;
-        let fuzzy = title_fuzzy_terms(&terms);
+        let parsed = self.parse_query(query)?;
+        Ok(self.fallback_query(&parsed, strict))
+    }
+
+    /// Резервный запрос по уже разобранным термам (см. [`Self::build_fuzzy_fallback_query`]).
+    fn fallback_query(&self, parsed: &ParsedQuery, strict: &dyn Query) -> Option<Box<dyn Query>> {
+        let terms = &parsed.terms;
+        let fuzzy = title_fuzzy_terms(terms);
         if fuzzy.is_empty() {
-            return Ok(None);
+            return None;
         }
 
+        let prefix = &parsed.prefix;
+        let last = terms.len() - 1;
         let mut variants: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(fuzzy.len() + 1);
         for &fixed in &fuzzy {
             let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(terms.len());
             for (index, term) in terms.iter().enumerate() {
-                clauses.push(self.per_term_query(&term.stem, index == fixed));
+                let prefix = if index == last { prefix.as_deref() } else { None };
+                clauses.push(self.per_term_query(term, index == fixed, prefix));
             }
             variants.push((Occur::Should, Box::new(BooleanQuery::new(clauses))));
         }
@@ -2217,7 +2802,7 @@ impl Library {
             Occur::Should,
             Box::new(BoostQuery::new(strict.box_clone(), BOOST_FALLBACK_STRICT)),
         ));
-        Ok(Some(Box::new(BooleanQuery::new(variants))))
+        Some(Box::new(BooleanQuery::new(variants)))
     }
 
     /// Полнотекстовый поиск по названию и автору (жанр в запросе не участвует).
@@ -2530,7 +3115,7 @@ mod tests {
     fn garbage_query_is_empty_and_not_approximate() -> Result<()> {
         let (dir, lib) = dostoevsky("garbage")?;
 
-        let out = lib.search("ъъъъ", None, None, false, CoverFilter::All, 0, 10)?;
+        let out = lib.search("ъъъ", None, None, false, CoverFilter::All, 0, 10)?;
 
         assert_eq!(out.filtered, 0);
         assert_eq!(out.matched, 0);
@@ -2757,6 +3342,106 @@ mod tests {
         let out = lib.search("Королев", None, None, false, CoverFilter::All, 0, 10)?;
         assert_eq!(out.matched, 1, "«Королев» должно находить «Королёв»");
         assert_eq!(out.books[0].id, 610);
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Библиотека из нескольких книг для тестов этапа B (автокомплит, ё, fuzzy).
+    fn small_library(name: &str) -> Result<(PathBuf, Library)> {
+        let dir = scratch(name);
+        let books = vec![
+            BookMetadata {
+                id: 900,
+                title: "Преступление и наказание".into(),
+                author: "Фёдор Достоевский".into(),
+                ..sample_book(900)
+            },
+            BookMetadata {
+                id: 901,
+                title: "Ёжик в тумане".into(),
+                author: "Сергей Козлов".into(),
+                ..sample_book(901)
+            },
+            BookMetadata {
+                id: 902,
+                title: "Шрек".into(),
+                author: "Уильям Стейг".into(),
+                ..sample_book(902)
+            },
+        ];
+        {
+            let lib = Library::open(&dir)?;
+            lib.append_metadata("900-902", &books)?;
+            let mut writer = lib.writer()?;
+            lib.index_books(&mut writer, &books)?;
+        }
+        let lib = Library::open(&dir)?;
+        Ok((dir, lib))
+    }
+
+    fn ids(lib: &Library, query: &str) -> Result<(Vec<u64>, bool)> {
+        let out = lib.search(query, None, None, false, CoverFilter::All, 0, 10)?;
+        Ok((out.books.iter().map(|b| b.id).collect(), out.approximate))
+    }
+
+    /// Недописанное слово находит книгу по префиксу — строгим путём, без fuzzy.
+    #[test]
+    fn unfinished_word_autocompletes() -> Result<()> {
+        let (dir, lib) = small_library("prefix")?;
+        assert_eq!(ids(&lib, "прест")?, (vec![900], false));
+        assert_eq!(ids(&lib, "преступление и нак")?, (vec![900], false));
+        assert_eq!(ids(&lib, "достоев")?, (vec![900], false), "префикс автора");
+        assert_eq!(lib.fallback_search_count(), 0, "префикс — не опечатка");
+        // Слово дописано (пробел в конце) — префикс не подставляется.
+        assert_eq!(ids(&lib, "прест ")?.0, Vec::<u64>::new());
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// «ё» и «е» — одна буква и в названии, и в запросе, без траты опечатки.
+    #[test]
+    fn yo_is_folded_in_text_fields() -> Result<()> {
+        let (dir, lib) = small_library("yo_text")?;
+        assert_eq!(ids(&lib, "ежик в тумане")?, (vec![901], false));
+        assert_eq!(ids(&lib, "ёжик")?, (vec![901], false));
+        assert_eq!(ids(&lib, "шрёк")?, (vec![902], false));
+        assert_eq!(ids(&lib, "федор достоевский")?, (vec![900], false));
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Одна опечатка в четырёхбуквенном слове исправляется через каскад.
+    #[test]
+    fn one_typo_in_short_word_is_fixed() -> Result<()> {
+        let (dir, lib) = small_library("typo_short")?;
+        assert_eq!(ids(&lib, "шрэк ")?, (vec![902], true));
+        assert_eq!(ids(&lib, "приступление")?, (vec![900], true));
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Повтор запроса берётся из кеша, а коммит индекса кеш обходит.
+    #[test]
+    fn repeated_search_is_cached_until_commit() -> Result<()> {
+        let (dir, lib) = small_library("cache")?;
+        assert_eq!(ids(&lib, "приступление")?, (vec![900], true));
+        assert_eq!(ids(&lib, "приступление")?, (vec![900], true));
+        assert_eq!(lib.fallback_search_count(), 1, "второй раз — из кеша");
+
+        let more = vec![BookMetadata {
+            id: 903,
+            title: "Преступление и наказание".into(),
+            author: "Другой автор".into(),
+            ..sample_book(903)
+        }];
+        lib.append_metadata("903-903", &more)?;
+        let mut writer = lib.writer()?;
+        lib.index_books(&mut writer, &more)?;
+        // Метаданные новой книги ещё не перечитаны — книга приходит из индекса,
+        // но главное: выдача новая, а не закешированная.
+        let (found, _) = ids(&lib, "приступление")?;
+        assert_eq!(found.len(), 2, "после коммита кеш не отдаёт старую выдачу");
 
         let _ = fs::remove_dir_all(&dir);
         Ok(())

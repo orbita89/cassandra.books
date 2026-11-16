@@ -638,6 +638,27 @@ impl Default for ImportSettings {
     }
 }
 
+/// Nice фоновых потоков (0 — обычный, 19 — самый низкий).
+///
+/// 10 — середина: импорт по-прежнему забирает свободные ядра целиком, но
+/// планировщик отдаёт CPU интерфейсу и поиску, как только они просыпаются.
+const BACKGROUND_NICE: libc::c_int = 10;
+
+/// Понизить приоритет **текущего** потока.
+///
+/// В Linux nice задаётся на поток (`setpriority` с `who = 0` трогает только
+/// вызывающий поток), а потоки, которые он создаст, — в том числе рабочие
+/// потоки импорта и запущенные им процессы (`arx`) — наследуют значение.
+/// Ошибку молча пропускаем: без пониженного приоритета импорт всё равно
+/// работает, просто наравне с интерфейсом.
+pub fn lower_thread_priority() {
+    #[cfg(target_os = "linux")]
+    // SAFETY: `setpriority` не трогает память процесса; аргументы — константы.
+    unsafe {
+        let _ = libc::setpriority(libc::PRIO_PROCESS, 0, BACKGROUND_NICE);
+    }
+}
+
 /// Запустить импорт в отдельном потоке. Возвращает сразу, UI не блокируется.
 pub fn spawn_import(
     zip: PathBuf,
@@ -646,6 +667,7 @@ pub fn spawn_import(
     tx: Sender<WorkerMsg>,
 ) {
     std::thread::spawn(move || {
+        lower_thread_priority();
         if let Err(err) = run_import(&zip, &data_dir, &settings, &tx) {
             let _ = tx.send(WorkerMsg::Error(format!("{err:#}")));
         }
@@ -664,6 +686,7 @@ pub fn spawn_dedup(
     tx: Sender<WorkerMsg>,
 ) {
     std::thread::spawn(move || {
+        lower_thread_priority();
         let report = |progress: crate::dedup::Progress| {
             let _ = tx.send(WorkerMsg::DedupProgress {
                 step: progress.step,
@@ -2046,5 +2069,33 @@ mod batch_tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod priority_tests {
+    /// Nice текущего потока из `/proc/thread-self/stat` (19-е поле).
+    fn thread_nice() -> i32 {
+        let stat = std::fs::read_to_string("/proc/thread-self/stat").unwrap();
+        // Имя потока в скобках может содержать пробелы — считаем после `)`.
+        let after = &stat[stat.rfind(')').unwrap() + 2..];
+        after.split_whitespace().nth(16).unwrap().parse().unwrap()
+    }
+
+    /// Пониженный приоритет ставится на поток и наследуется его потомками,
+    /// а соседние потоки (интерфейс) остаются с обычным.
+    #[test]
+    fn background_priority_is_per_thread_and_inherited() {
+        let main_before = thread_nice();
+        let (own, child) = std::thread::spawn(|| {
+            super::lower_thread_priority();
+            let child = std::thread::spawn(thread_nice).join().unwrap();
+            (thread_nice(), child)
+        })
+        .join()
+        .unwrap();
+        assert_eq!(own, super::BACKGROUND_NICE.max(main_before));
+        assert_eq!(child, own, "поток, созданный фоновым, наследует приоритет");
+        assert_eq!(thread_nice(), main_before, "остальные потоки не тронуты");
     }
 }

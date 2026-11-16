@@ -14,6 +14,7 @@ mod dedup;
 mod fb2epub;
 mod genres;
 mod images;
+mod title_suggest;
 mod ui;
 mod worker;
 
@@ -313,14 +314,93 @@ impl DedupState {
     }
 }
 
+/// Запрос к потоку поиска (см. [`spawn_search_thread`]).
+struct SearchRequest {
+    /// Номер запроса: ответ на устаревший номер интерфейс выбрасывает.
+    generation: u64,
+    query: String,
+    author: Option<String>,
+    genre: Option<String>,
+    show_short: bool,
+    cover: db::CoverFilter,
+    offset: usize,
+    limit: usize,
+}
+
+/// Ответ потока поиска.
+struct SearchReply {
+    generation: u64,
+    outcome: std::result::Result<db::SearchOutcome, String>,
+}
+
+/// Поток поиска: интерфейс не ждёт Tantivy и не подвисает при наборе.
+///
+/// Из очереди берётся только **последний** запрос — промежуточные (человек
+/// успел напечатать ещё букву) выбрасываются, не дойдя до индекса. Библиотека
+/// читается под `RwLock::read`: писатель только поток интерфейса
+/// (`reload_metadata`, `reload_library`), и он ждёт максимум один поиск.
+fn spawn_search_thread(
+    library: std::sync::Arc<std::sync::RwLock<Library>>,
+    requests: Receiver<SearchRequest>,
+    replies: Sender<SearchReply>,
+) {
+    std::thread::Builder::new()
+        .name("search".into())
+        .spawn(move || {
+            while let Ok(mut request) = requests.recv() {
+                while let Ok(newer) = requests.try_recv() {
+                    request = newer;
+                }
+                let outcome = library
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .search(
+                        &request.query,
+                        request.author.as_deref(),
+                        request.genre.as_deref(),
+                        request.show_short,
+                        request.cover,
+                        request.offset,
+                        request.limit,
+                    )
+                    .map_err(|err| format!("{err:#}"));
+                let reply = SearchReply {
+                    generation: request.generation,
+                    outcome,
+                };
+                if replies.send(reply).is_err() {
+                    break; // окно закрыто
+                }
+            }
+        })
+        .expect("не удалось запустить поток поиска");
+}
+
+/// Сколько названий и авторов показывать в подсказках под строкой поиска.
+const MAX_TITLE_SUGGESTIONS: usize = 6;
+const MAX_AUTHOR_SUGGESTIONS: usize = 4;
+
 /// Всё состояние приложения.
 pub struct App {
-    /// Открытая библиотека (индекс + метаданные).
-    pub library: Library,
+    /// Открытая библиотека (индекс + метаданные). Под `RwLock`, потому что её
+    /// читает и поток поиска; читать — [`App::lib`], менять — [`App::lib_mut`].
+    pub library: std::sync::Arc<std::sync::RwLock<Library>>,
+    /// Очередь запросов в поток поиска.
+    search_tx: Sender<SearchRequest>,
+    /// Ответы потока поиска.
+    search_rx: Receiver<SearchReply>,
+    /// Номер последнего отправленного (или синхронного) поиска.
+    search_generation: u64,
+    /// Ждём ответа потока поиска — интерфейс показывает индикатор.
+    pub searching: bool,
     /// Текст в строке поиска.
     pub query: String,
     /// Запрос, по которому построен текущий `results`.
     pub last_query: String,
+    /// Когда строку поиска правили последний раз — для debounce (см. `ui::draw`).
+    pub query_edited_at: std::time::Instant,
+    /// Искать сразу, не дожидаясь паузы (Enter, «Сбросить»).
+    pub search_now: bool,
     /// Книги текущей страницы (после фильтров).
     pub results: Vec<BookMetadata>,
     /// Номер страницы выдачи, с нуля.
@@ -345,6 +425,13 @@ pub struct App {
     /// библиотеки (импорт, вынос дубликатов), а не в `refresh_search`: иначе
     /// каждый запрос заново читал бы словарь термов Tantivy.
     pub author_dictionary: author_suggest::AuthorDictionary,
+    /// Словарь названий для подсказок под строкой поиска; собирается вместе
+    /// со словарём авторов.
+    pub title_dictionary: title_suggest::TitleDictionary,
+    /// Подсказки к текущему тексту строки поиска: названия и авторы.
+    /// Пересчитываются только при правке текста, а не на каждом кадре.
+    pub suggest_titles: Vec<(String, usize)>,
+    pub suggest_authors: Vec<(String, usize)>,
     /// Фильтр по жанру — точное совпадение; `None` значит «все».
     pub filter_genre: Option<String>,
     /// Показывать статьи и заметки: по умолчанию они спрятаны, см.
@@ -388,12 +475,21 @@ pub struct App {
 impl App {
     /// Создать приложение и открыть библиотеку в `data_dir`.
     pub fn new(data_dir: PathBuf) -> Result<Self> {
-        let library = Library::open(&data_dir)?;
+        let library = std::sync::Arc::new(std::sync::RwLock::new(Library::open(&data_dir)?));
         let (tx, rx) = unbounded();
+        let (search_tx, requests) = unbounded();
+        let (replies, search_rx) = unbounded();
+        spawn_search_thread(library.clone(), requests, replies);
         let mut app = Self {
             library,
+            search_tx,
+            search_rx,
+            search_generation: 0,
+            searching: false,
             query: String::new(),
             last_query: String::new(),
+            query_edited_at: std::time::Instant::now(),
+            search_now: false,
             results: Vec::new(),
             page: 0,
             page_size: db::DEFAULT_SEARCH_LIMIT,
@@ -403,6 +499,9 @@ impl App {
             filter_author: None,
             author_query: String::new(),
             author_dictionary: author_suggest::AuthorDictionary::empty(),
+            title_dictionary: title_suggest::TitleDictionary::empty(),
+            suggest_titles: Vec::new(),
+            suggest_authors: Vec::new(),
             filter_genre: None,
             show_short: false,
             cover_filter: db::CoverFilter::All,
@@ -443,7 +542,8 @@ impl App {
     /// вызывается при старте, после [`App::reload_library`] и после импорта —
     /// но не в [`App::refresh_search`].
     pub fn rebuild_author_dictionary(&mut self) {
-        match self.library.author_dictionary() {
+        let authors = self.lib().author_dictionary();
+        match authors {
             Ok(authors) => {
                 self.author_dictionary = author_suggest::AuthorDictionary::new(authors);
             }
@@ -451,6 +551,23 @@ impl App {
                 self.error = Some(format!("не удалось собрать словарь авторов: {err:#}"));
             }
         }
+        let titles = self.lib().title_dictionary();
+        self.title_dictionary = title_suggest::TitleDictionary::new(titles);
+        self.update_suggestions();
+    }
+
+    /// Пересчитать подсказки под строкой поиска по текущему тексту.
+    pub fn update_suggestions(&mut self) {
+        self.suggest_titles = self.title_dictionary.suggestions(&self.query, MAX_TITLE_SUGGESTIONS);
+        self.suggest_authors = self
+            .author_dictionary
+            .suggestions(&self.query, MAX_AUTHOR_SUGGESTIONS);
+    }
+
+    /// Скрыть подсказки (выбрали одну, сбросили запрос).
+    pub fn hide_suggestions(&mut self) {
+        self.suggest_titles.clear();
+        self.suggest_authors.clear();
     }
 
     /// Сколько страниц в текущей выдаче (минимум одна).
@@ -464,9 +581,10 @@ impl App {
     /// достаточно подменить `Library` целиком: так в памяти оказываются и
     /// новые метаданные, и новый читатель Tantivy.
     pub fn reload_library(&mut self) {
-        match Library::open(&self.library.data_dir) {
+        let data_dir = self.lib().data_dir.clone();
+        match Library::open(&data_dir) {
             Ok(library) => {
-                self.library = library;
+                *self.lib_mut() = library;
                 self.selected = None;
                 self.details_open = false;
                 // Индекс пересобран — словарь авторов тоже должен быть новым.
@@ -480,50 +598,113 @@ impl App {
         }
     }
 
-    /// Пересчитать выдачу по текущему запросу, фильтрам и номеру страницы.
-    pub fn refresh_search(&mut self) -> Result<()> {
-        // Новый запрос всегда открывается с первой страницы; перелистывание
-        // запрос не меняет, поэтому страницу не сбрасывает.
+    /// Библиотека на чтение.
+    pub fn lib(&self) -> std::sync::RwLockReadGuard<'_, Library> {
+        self.library.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Библиотека на запись (ждёт, пока поток поиска закончит текущий поиск).
+    pub fn lib_mut(&self) -> std::sync::RwLockWriteGuard<'_, Library> {
+        self.library.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Общая часть синхронного и фонового поиска: новый запрос — с первой
+    /// страницы (перелистывание запрос не меняет и страницу не сбрасывает),
+    /// размер страницы — в допустимых пределах; новый номер поиска делает
+    /// все ответы, которые ещё в пути, устаревшими.
+    fn begin_search(&mut self) -> SearchRequest {
         if self.query != self.last_query {
             self.page = 0;
         }
         self.page_size = self.page_size.clamp(1, db::MAX_PAGE_SIZE);
-
-        loop {
-            let outcome = self.library.search(
-                &self.query,
-                self.filter_author.as_deref(),
-                self.filter_genre.as_deref(),
-                self.show_short,
-                self.cover_filter,
-                self.page * self.page_size,
-                self.page_size,
-            )?;
-            self.matched = outcome.matched;
-            self.filtered = outcome.filtered;
-            // Признак пересчитывается на каждом проходе: если страница
-            // «съехала» и поиск повторится, пометка обязана соответствовать
-            // последней выдаче.
-            self.approximate = outcome.approximate;
-            let pages = self.pages();
-            // Страница могла исчезнуть — например, после смены фильтра книг
-            // стало меньше. Тогда показываем последнюю, а не пустоту.
-            if self.page >= pages {
-                self.page = pages - 1;
-                continue;
-            }
-            self.results = outcome.books;
-            self.authors = outcome.authors;
-            self.genres = outcome.genres;
-            break;
-        }
         self.last_query = self.query.clone();
+        self.search_generation += 1;
+        SearchRequest {
+            generation: self.search_generation,
+            query: self.query.clone(),
+            author: self.filter_author.clone(),
+            genre: self.filter_genre.clone(),
+            show_short: self.show_short,
+            cover: self.cover_filter,
+            offset: self.page * self.page_size,
+            limit: self.page_size,
+        }
+    }
 
+    /// Показать выдачу. `false` — страница «съехала» (книг стало меньше,
+    /// например после смены фильтра): номер страницы уже поправлен на
+    /// последнюю, и поиск надо повторить.
+    fn apply_outcome(&mut self, outcome: db::SearchOutcome) -> bool {
+        self.matched = outcome.matched;
+        self.filtered = outcome.filtered;
+        self.approximate = outcome.approximate;
+        let pages = self.pages();
+        if self.page >= pages {
+            self.page = pages - 1;
+            return false;
+        }
+        self.results = outcome.books;
+        self.authors = outcome.authors;
+        self.genres = outcome.genres;
         // Выбранная книга могла исчезнуть из выдачи после смены фильтра.
         if self.selected.map(|i| i >= self.results.len()).unwrap_or(false) {
             self.selected = None;
         }
-        Ok(())
+        true
+    }
+
+    /// Пересчитать выдачу **сразу**, в этом потоке.
+    ///
+    /// Для старта, перезагрузки библиотеки и тестов. Интерфейс при наборе и
+    /// листании зовёт [`App::start_search`] — он не блокирует кадр.
+    pub fn refresh_search(&mut self) -> Result<()> {
+        self.searching = false;
+        loop {
+            let request = self.begin_search();
+            let outcome = self.lib().search(
+                &request.query,
+                request.author.as_deref(),
+                request.genre.as_deref(),
+                request.show_short,
+                request.cover,
+                request.offset,
+                request.limit,
+            )?;
+            if self.apply_outcome(outcome) {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Отправить поиск в фоновый поток; результат заберёт [`App::poll_search`].
+    pub fn start_search(&mut self) {
+        let request = self.begin_search();
+        self.searching = true;
+        if self.search_tx.send(request).is_err() {
+            // Поток поиска умер (паника) — ищем по-старому, в кадре.
+            if let Err(err) = self.refresh_search() {
+                self.error = Some(format!("поиск не удался: {err:#}"));
+            }
+        }
+    }
+
+    /// Забрать ответы потока поиска. Устаревшие (номер не последний)
+    /// выбрасываются.
+    pub fn poll_search(&mut self) {
+        while let Ok(reply) = self.search_rx.try_recv() {
+            if reply.generation != self.search_generation {
+                continue;
+            }
+            self.searching = false;
+            match reply.outcome {
+                Ok(outcome) => {
+                    if !self.apply_outcome(outcome) {
+                        self.start_search();
+                    }
+                }
+                Err(err) => self.error = Some(format!("поиск не удался: {err}")),
+            }
+        }
     }
 
     /// Сбросить фильтры по автору и жанру и очистить поле автодополнения.
@@ -551,12 +732,14 @@ impl App {
 
     /// Пересчитать размер кэша распакованных книг.
     pub fn refresh_cache_usage(&mut self) {
-        self.cache = self.library.cache_usage();
+        let usage = self.lib().cache_usage();
+        self.cache = usage;
     }
 
     /// Очистить кэш распакованных книг.
     pub fn clear_cache(&mut self) {
-        match self.library.clear_cache() {
+        let cleared = self.lib().clear_cache();
+        match cleared {
             Ok(n) => self.toast = Some(format!("кэш очищен, удалено файлов: {n}")),
             Err(err) => self.error = Some(format!("не удалось очистить кэш: {err:#}")),
         }
@@ -594,19 +777,19 @@ impl App {
     /// авторов, тома и обложки), а кнопка только показывает, что уедет, и
     /// спрашивает разрешения.
     pub fn open_dedup_dialog(&mut self) {
-        let Some(path) = dedup::find_plan(&self.library.data_dir) else {
+        let Some(path) = dedup::find_plan(&self.lib().data_dir) else {
             self.error = Some(format!(
                 "не найден план выноса. Сначала постройте его:\n\
                  python3 dedup.py --phash\n\
                  (ожидается {} или {})",
-                self.library
+                self.lib()
                     .data_dir
                     .parent()
                     .unwrap_or(Path::new("."))
                     .join(dedup::REPORT_DIR)
                     .join(dedup::PLAN_NAME)
                     .display(),
-                self.library
+                self.lib()
                     .data_dir
                     .join(dedup::REPORT_DIR)
                     .join(dedup::PLAN_NAME)
@@ -655,7 +838,7 @@ impl App {
         };
         worker::spawn_dedup(
             dialog.plan,
-            self.library.data_dir.clone(),
+            self.lib().data_dir.clone(),
             jobs,
             self.tx.clone(),
         );
@@ -669,7 +852,7 @@ impl App {
             .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Downloads")))
             .filter(|p| p.is_dir())
             .unwrap_or_else(|| PathBuf::from("."));
-        let archives = self.library.archives_dir();
+        let archives = self.lib().archives_dir();
         self.zip_picker = Some(ZipPicker::open(dir, &archives));
     }
 
@@ -688,7 +871,7 @@ impl App {
         self.import.total = 0;
         self.import.last_batch = None;
         self.import.status = "распаковка...".to_string();
-        let data_dir = self.library.data_dir.clone();
+        let data_dir = self.lib().data_dir.clone();
         worker::spawn_import(zip, data_dir, self.settings.clone(), self.tx.clone());
         true
     }
@@ -777,7 +960,7 @@ impl App {
                     if !self.start_next_import() {
                         // Новые книги должны сразу находиться поиском, а их
                         // авторы — в подсказках: словарь зависит от индекса.
-                        let _ = self.library.reload_metadata();
+                        let _ = self.lib_mut().reload_metadata();
                         self.rebuild_author_dictionary();
                         let _ = self.refresh_search();
                         self.refresh_cache_usage();
@@ -792,7 +975,7 @@ impl App {
                     self.error = Some(err);
                     // Один битый архив не должен останавливать очередь.
                     if !self.start_next_import() {
-                        let _ = self.library.reload_metadata();
+                        let _ = self.lib_mut().reload_metadata();
                         self.rebuild_author_dictionary();
                         let _ = self.refresh_search();
                         self.refresh_cache_usage();
@@ -960,8 +1143,12 @@ fn main() -> eframe::Result<()> {
     // AVIF-энкодер (`ravif`) зовёт `rayon::join`; когда его вызывают не из
     // rayon-воркера (а именно так теперь работает импорт), работа уходит в
     // глобальный пул rayon. Даём ему большой стек: `rav1e` рекурсивный.
+    //
+    // Потоки пула — фоновая работа (кодирование картинок), поэтому им сразу
+    // понижается приоритет: интерфейс и поиск не должны ждать импорт.
     let _ = rayon::ThreadPoolBuilder::new()
         .stack_size(16 * 1024 * 1024)
+        .start_handler(|_| worker::lower_thread_priority())
         .build_global();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -977,6 +1164,7 @@ fn main() -> eframe::Result<()> {
             "                                            можно несколько — по очереди,\n",
             "                                            --delete удаляет исходники\n",
             "  library_gui --search <запрос> [data_dir] [--author X] [--genre Y]\n",
+            "  library_gui --bench-search [data_dir]      замер памяти и скорости поиска\n",
             "                                            поиск без окна\n",
             "  library_gui --convert <fb2> <epub>         конвертация FB2 → EPUB 3.3\n",
             "                                            без окна (отладка конвертера)\n",
@@ -1132,6 +1320,12 @@ fn main() -> eframe::Result<()> {
     // ровно так же, как это делает импорт, и положить рядом `.avif`.
     if args.first().map(String::as_str) == Some("--image") {
         std::process::exit(run_image_mode(&args[1..]));
+    }
+
+    // Замер поиска на настоящей базе: `library_gui --bench-search [data_dir]`.
+    if args.first().map(String::as_str) == Some("--bench-search") {
+        let data_dir = args.get(1).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("data"));
+        std::process::exit(run_bench_search(&data_dir));
     }
 
     // Служебный режим без окна:
@@ -1597,6 +1791,131 @@ fn run_reindex(data_dir: PathBuf) -> i32 {
     }
 }
 
+/// Память процесса из `/proc/self/status`: (текущая RSS, пиковая RSS), МБ.
+fn memory_mb() -> (f64, f64) {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let field = |name: &str| {
+        status
+            .lines()
+            .find(|l| l.starts_with(name))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|kb| kb.parse::<f64>().ok())
+            .map_or(0.0, |kb| kb / 1024.0)
+    };
+    (field("VmRSS:"), field("VmHWM:"))
+}
+
+/// Замер: память после открытия библиотеки и время запросов разных типов.
+///
+/// Каждый запрос гоняется в обход кеша (`search_uncached`): первый прогон —
+/// «холодный» (страницы индекса ещё не в page cache), дальше 20 тёплых, из
+/// них медиана и максимум. Отдельно — время попадания в кеш.
+fn run_bench_search(data_dir: &Path) -> i32 {
+    use std::time::Instant;
+    let (rss0, _) = memory_mb();
+    let started = Instant::now();
+    let library = match Library::open(data_dir) {
+        Ok(l) => l,
+        Err(err) => {
+            eprintln!("ошибка: {err:#}");
+            return 1;
+        }
+    };
+    let open_s = started.elapsed().as_secs_f64();
+    let (rss1, peak1) = memory_mb();
+    println!("книг: {}", library.books.len());
+    println!("открытие библиотеки: {open_s:.1} с");
+    println!(
+        "память: до открытия {rss0:.0} МБ, после {rss1:.0} МБ (пик {peak1:.0} МБ)"
+    );
+
+    let all = db::CoverFilter::All;
+    let cases: &[(&str, &str, Option<&str>, Option<&str>, db::CoverFilter)] = &[
+        ("пустой (главная, алфавит)", "", None, None, all),
+        ("пустой + фильтр обложки", "", None, None, db::CoverFilter::WithCover),
+        ("частое слово", "история", None, None, all),
+        ("частое слово", "война", None, None, all),
+        ("название целиком", "мастер и маргарита", None, None, all),
+        ("название целиком", "преступление и наказание", None, None, all),
+        ("автор", "стругацкий", None, None, all),
+        ("автокомплит", "прест", None, None, all),
+        ("автокомплит", "булг", None, None, all),
+        ("автокомплит короткий", "при", None, None, all),
+        ("опечатка", "приступление", None, None, all),
+        ("опечатка", "мастр и маргарита", None, None, all),
+        ("мусор", "ъъъъъ", None, None, all),
+        ("слово + фильтр обложки", "история", None, None, db::CoverFilter::WithCover),
+    ];
+    println!();
+    println!(
+        "{:<28} {:<26} {:>9} {:>9} {:>9} {:>9}",
+        "тип", "запрос", "холодный", "медиана", "макс", "найдено"
+    );
+    for &(kind, query, author, genre, cover) in cases {
+        let run = || {
+            let t = Instant::now();
+            let out = library.search_uncached(
+                query,
+                author,
+                genre,
+                false,
+                cover,
+                0,
+                db::DEFAULT_SEARCH_LIMIT,
+            );
+            (t.elapsed().as_secs_f64() * 1000.0, out)
+        };
+        let (cold, out) = run();
+        let found = match out {
+            Ok(o) => o.filtered,
+            Err(err) => {
+                eprintln!("{query}: {err:#}");
+                continue;
+            }
+        };
+        let mut warm: Vec<f64> = (0..20).map(|_| run().0).collect();
+        warm.sort_by(f64::total_cmp);
+        println!(
+            "{kind:<28} {:<26} {cold:>7.1}мс {:>7.1}мс {:>7.1}мс {found:>9}",
+            format!("«{query}»"),
+            warm[warm.len() / 2],
+            warm[warm.len() - 1],
+        );
+    }
+
+    // Попадание в кеш: первый вызов кладёт, второй берёт.
+    let _ = library.search("история", None, None, false, all, 0, db::DEFAULT_SEARCH_LIMIT);
+    let t = Instant::now();
+    let _ = library.search("история", None, None, false, all, 0, db::DEFAULT_SEARCH_LIMIT);
+    println!("\nпопадание в кеш: {:.3} мс", t.elapsed().as_secs_f64() * 1000.0);
+
+    // Словарь подсказок названий: сборка, память, время подсказки.
+    let (rss_before, _) = memory_mb();
+    let t = Instant::now();
+    let titles = title_suggest::TitleDictionary::new(library.title_dictionary());
+    let build = t.elapsed().as_secs_f64();
+    let (rss_after, _) = memory_mb();
+    println!(
+        "\nсловарь названий: {} названий, сборка {build:.2} с, память +{:.0} МБ",
+        titles.len(),
+        rss_after - rss_before
+    );
+    for query in ["при", "мастер и м", "маргар", "война и", "гарри поттер"] {
+        let t = Instant::now();
+        let mut out = Vec::new();
+        for _ in 0..20 {
+            out = titles.suggestions(query, 6);
+        }
+        let ms = t.elapsed().as_secs_f64() * 1000.0 / 20.0;
+        let first: Vec<&str> = out.iter().take(3).map(|(n, _)| n.as_str()).collect();
+        println!("  подсказка «{query}»: {ms:.2} мс → {first:?}");
+    }
+
+    let (rss2, peak2) = memory_mb();
+    println!("память в конце: {rss2:.0} МБ (пик {peak2:.0} МБ)");
+    0
+}
+
 fn run_headless_search(
     query: &str,
     data_dir: PathBuf,
@@ -1706,6 +2025,11 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Забираем сообщения фонового потока в начале кадра.
         self.pump_worker();
+        self.poll_search();
+        // Пока ждём ответа потока поиска — будим кадры, чтобы его забрать.
+        if self.searching {
+            ctx.request_repaint_after(std::time::Duration::from_millis(15));
+        }
         // Пока идёт импорт — перерисовываем постоянно, иначе egui спит.
         if self.import.running {
             ctx.request_repaint_after(std::time::Duration::from_millis(120));
@@ -1745,6 +2069,58 @@ mod tests {
     ///
     /// Это уровень, который видит интерфейс: `App::refresh_search` сам
     /// прижимает страницу к последней, когда фильтр сократил выдачу.
+    /// Дождаться ответа потока поиска (как это делают кадры интерфейса).
+    fn wait_search(app: &mut App) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.searching {
+            assert!(std::time::Instant::now() < deadline, "поток поиска не ответил");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            app.poll_search();
+        }
+    }
+
+    /// Фоновый поиск: показывается ответ только на **последний** запрос, а
+    /// «съехавшая» страница прижимается к последней, как и в синхронном.
+    #[test]
+    fn background_search_shows_only_the_latest_query() -> Result<()> {
+        let dir = std::env::temp_dir().join("library_gui_test_bg_search");
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let lib = Library::open(&dir)?;
+            let mut books: Vec<BookMetadata> =
+                (1..=25).map(|i| sample_book(i, &format!("Книга {i:02}"))).collect();
+            books.push(sample_book(99, "Преступление и наказание"));
+            lib.append_metadata("1-99", &books)?;
+            let mut writer = lib.writer()?;
+            lib.index_books(&mut writer, &books)?;
+        }
+        let mut app = App::new(dir.clone())?;
+
+        // Несколько запросов подряд, как при наборе: устаревшие ответы
+        // выбрасываются, на экране — выдача последнего.
+        for query in ["книга", "преступ", "преступление"] {
+            app.query = query.into();
+            app.start_search();
+        }
+        wait_search(&mut app);
+        assert_eq!(app.results.iter().map(|b| b.id).collect::<Vec<_>>(), vec![99]);
+        assert_eq!(app.last_query, "преступление");
+
+        // Страница за пределами выдачи — поиск повторяется с последней.
+        app.query = "книга".into();
+        app.page_size = 10;
+        app.start_search();
+        wait_search(&mut app);
+        app.page = 99;
+        app.start_search();
+        wait_search(&mut app);
+        assert_eq!(app.page, 2, "страница прижата к последней");
+        assert_eq!(app.results.len(), 5);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
     #[test]
     fn app_pages_through_the_library() -> Result<()> {
         let dir = std::env::temp_dir().join("library_gui_test_app_paging");

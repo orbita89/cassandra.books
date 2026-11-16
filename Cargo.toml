@@ -37,6 +37,9 @@ libwebp-sys = "0.9"
 # если в системе нет заголовков harfbuzz и clang (bindgen).
 hb-subset = { version = "0.3", optional = true }
 rayon = "1"
+# `setpriority`: фоновые потоки импорта получают пониженный приоритет
+# (см. `worker::lower_thread_priority`). Уже есть в дереве зависимостей.
+libc = "0.2"
 # Разбор FB2 в нативном конвертере (`src/fb2epub.rs`) — вместо Calibre.
 quick-xml = "0.42"
 

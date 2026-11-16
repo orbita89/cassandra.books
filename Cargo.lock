@@ -2569,6 +2569,7 @@ dependencies = [
  "egui_extras",
  "hb-subset",
  "image",
+ "libc",
  "libwebp-sys",
  "quick-xml 0.42.0",
  "rayon",
